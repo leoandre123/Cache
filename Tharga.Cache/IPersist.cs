@@ -3,6 +3,24 @@
 public interface IPersist
 {
     Task<CacheItem<T>> GetAsync<T>(Key key);
+
+    /// <summary>
+    /// Reads several keys. The result has one entry per requested key, in the requested order, with a null
+    /// <see cref="CacheItem{T}"/> for keys that are not cached.
+    /// The default implementation calls <see cref="GetAsync{T}"/> once per key; backends that can read many keys
+    /// in one round trip override it.
+    /// </summary>
+    async Task<IReadOnlyList<(Key Key, CacheItem<T> CacheItem)>> GetManyAsync<T>(IEnumerable<Key> keys)
+    {
+        var result = new List<(Key Key, CacheItem<T> CacheItem)>();
+        foreach (var key in keys)
+        {
+            result.Add((key, await GetAsync<T>(key)));
+        }
+
+        return result;
+    }
+
     IAsyncEnumerable<(Key Key, CacheItem<T> CacheItem)> FindAsync<T>(Key key);
     Task SetAsync<T>(Key key, CacheItem<T> cacheItem, bool staleWhileRevalidate);
     Task<bool> BuyMoreTime<T>(Key key);

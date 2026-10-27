@@ -18,6 +18,11 @@ namespace Tharga.Cache.Redis.Tests;
 public class RedisRoundTripTests
 {
     private const string StoredKey = "String.a";
+
+    /// <summary>
+    /// The hash slot a non-cluster connection gives every key (StackExchange.Redis' internal ServerSelectionStrategy.NoSlot).
+    /// </summary>
+    private const int NoSlot = -1;
     private static readonly TimeSpan FreshSpan = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan RemainingTimeToLive = TimeSpan.FromMinutes(3);
 
@@ -31,6 +36,63 @@ public class RedisRoundTripTests
         _connection.Setup(x => x.IsConnected).Returns(true);
         _connection.Setup(x => x.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(_database.Object);
         _sut = new Redis(Mock.Of<IServiceProvider>(), Mock.Of<IHostEnvironment>(), Mock.Of<IManagedCacheMonitor>(), Options.Create(new RedisCacheOptions { RetryCount = 0 }), _logger.Object, _connection.Object);
+    }
+
+    [Fact]
+    public async Task GetManyAsync_reads_all_keys_with_one_MGET()
+    {
+        //Arrange
+        var item = BuildItem("a", TimeSpan.FromMinutes(1));
+        RedisKey[] requested = null;
+        _connection.Setup(x => x.HashSlot(It.IsAny<RedisKey>())).Returns(NoSlot);
+        _database.Setup(x => x.StringGetAsync(It.IsAny<RedisKey[]>(), It.IsAny<CommandFlags>()))
+            .Callback<RedisKey[], CommandFlags>((keys, _) => requested = keys)
+            .ReturnsAsync([JsonSerializer.Serialize(item), RedisValue.Null, JsonSerializer.Serialize(item with { Data = "c" })]);
+
+        //Act
+        var result = await _sut.GetManyAsync<string>(["String.a", "String.b", "String.c"]);
+
+        //Assert
+        _database.Verify(x => x.StringGetAsync(It.IsAny<RedisKey[]>(), It.IsAny<CommandFlags>()), Times.Once);
+        _database.Verify(x => x.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
+        requested.Select(x => (string)x).Should().Equal("String.a", "String.b", "String.c");
+        result.Select(x => x.Key.Value).Should().Equal("String.a", "String.b", "String.c");
+        result.Select(x => x.CacheItem?.Data).Should().Equal("a", null, "c");
+    }
+
+    [Fact]
+    public async Task GetManyAsync_sends_one_MGET_per_cluster_hash_slot()
+    {
+        //Arrange
+        _connection.Setup(x => x.HashSlot(It.IsAny<RedisKey>())).Returns<RedisKey>(x => (string)x == "String.b" ? 2 : 1);
+        _database.Setup(x => x.StringGetAsync(It.IsAny<RedisKey[]>(), It.IsAny<CommandFlags>()))
+            .Returns<RedisKey[], CommandFlags>((keys, _) => Task.FromResult(keys.Select(x => (RedisValue)JsonSerializer.Serialize(BuildItem((string)x, null))).ToArray()));
+
+        //Act
+        var result = await _sut.GetManyAsync<string>(["String.a", "String.b", "String.c"]);
+
+        //Assert
+        _database.Verify(x => x.StringGetAsync(It.IsAny<RedisKey[]>(), It.IsAny<CommandFlags>()), Times.Exactly(2));
+        result.Select(x => x.CacheItem.Data).Should().Equal("String.a", "String.b", "String.c");
+    }
+
+    [Fact]
+    public async Task Touch_after_GetManyAsync_does_not_read_again()
+    {
+        //Arrange
+        var stored = JsonSerializer.Serialize(BuildItem("a", FreshSpan));
+        _connection.Setup(x => x.HashSlot(It.IsAny<RedisKey>())).Returns(NoSlot);
+        _database.Setup(x => x.StringGetAsync(It.IsAny<RedisKey[]>(), It.IsAny<CommandFlags>())).ReturnsAsync([stored]);
+        var script = SetupScript(1);
+        var read = (await _sut.GetManyAsync<string>([StoredKey])).Single().CacheItem;
+
+        //Act
+        var touched = await _sut.BuyMoreTime(StoredKey, read, false);
+
+        //Assert
+        touched.Should().BeTrue();
+        _database.Verify(x => x.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
+        script().Expected.Should().Be(Sha1(stored));
     }
 
     [Theory]

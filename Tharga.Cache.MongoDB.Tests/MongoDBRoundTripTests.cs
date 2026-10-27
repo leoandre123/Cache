@@ -59,6 +59,44 @@ public class MongoDBRoundTripTests
         rendered["UpdateTime"].IsBsonNull.Should().BeTrue();
     }
 
+    [Fact]
+    public async Task GetManyAsync_reads_all_keys_with_one_find()
+    {
+        //Arrange
+        var now = DateTime.UtcNow;
+        FilterDefinition<CacheEntity> captured = null;
+        _collection
+            .Setup(x => x.GetAsync(It.IsAny<FilterDefinition<CacheEntity>>(), It.IsAny<Options<CacheEntity>>(), It.IsAny<CancellationToken>()))
+            .Callback<FilterDefinition<CacheEntity>, Options<CacheEntity>, CancellationToken>((f, _, _) => captured = f)
+            .Returns(ToAsync(BuildEntity("String.c", now), BuildEntity("String.a", now)));
+
+        //Act
+        var result = await _sut.GetManyAsync<string>(["String.a", "String.b", "String.c"]);
+
+        //Assert
+        _collection.Verify(x => x.GetAsync(It.IsAny<FilterDefinition<CacheEntity>>(), It.IsAny<Options<CacheEntity>>(), It.IsAny<CancellationToken>()), Times.Once);
+        _collection.Verify(x => x.GetOneAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        Render(captured)["_id"]["$in"].AsBsonArray.Select(x => x.AsString).Should().Equal("String.a", "String.b", "String.c");
+        result.Select(x => x.Key.Value).Should().Equal("String.a", "String.b", "String.c");
+        result.Select(x => x.CacheItem?.Data).Should().Equal("String.a", null, "String.c");
+    }
+
+    [Fact]
+    public async Task GetManyAsync_skips_an_entity_that_was_not_asked_for()
+    {
+        //Arrange
+        var now = DateTime.UtcNow;
+        _collection
+            .Setup(x => x.GetAsync(It.IsAny<FilterDefinition<CacheEntity>>(), It.IsAny<Options<CacheEntity>>(), It.IsAny<CancellationToken>()))
+            .Returns(ToAsync(BuildEntity("String.a", now), BuildEntity("String.unknown", now)));
+
+        //Act
+        var result = await _sut.GetManyAsync<string>(["String.a", "String.b"]);
+
+        //Assert
+        result.Select(x => x.CacheItem?.Data).Should().Equal("String.a", null);
+    }
+
     private static CacheEntity BuildEntity(string id, DateTime createTime)
     {
         return new CacheEntity
@@ -80,5 +118,14 @@ public class MongoDBRoundTripTests
     private static BsonDocument Render(FilterDefinition<CacheEntity> filter)
     {
         return filter.Render(new RenderArgs<CacheEntity>(BsonSerializer.SerializerRegistry.GetSerializer<CacheEntity>(), BsonSerializer.SerializerRegistry));
+    }
+
+    private static async IAsyncEnumerable<CacheEntity> ToAsync(params CacheEntity[] entities)
+    {
+        foreach (var entity in entities)
+        {
+            await Task.Yield();
+            yield return entity;
+        }
     }
 }

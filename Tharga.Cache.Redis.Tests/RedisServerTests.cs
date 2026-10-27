@@ -283,6 +283,66 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
         (await Database.KeyExistsAsync(key.Value)).Should().BeFalse();
     }
 
+    [Fact]
+    public async Task GetManyAsync_matches_GetAsync_per_key()
+    {
+        //Arrange
+        var persist = BuildPersist();
+        Key[] keys = [StoredKey(NewKey()), StoredKey(NewKey()), StoredKey(NewKey())];
+        await persist.SetAsync(keys[0], BuildItem("a"), false);
+        await persist.SetAsync(keys[2], BuildItem("c"), true);
+
+        //Act
+        var result = await persist.GetManyAsync<string>(keys);
+
+        //Assert
+        var expected = new List<CacheItem<string>>();
+        foreach (var key in keys)
+        {
+            expected.Add(await persist.GetAsync<string>(key));
+        }
+
+        result.Select(x => x.Key).Should().Equal(keys);
+        result.Select(x => x.CacheItem).Should().BeEquivalentTo(expected, o => o.WithStrictOrdering());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PeekManyAsync_matches_PeekAsync_per_key(bool staleWhileRevalidate)
+    {
+        //Arrange
+        var single = BuildCache(o => o.StaleWhileRevalidate = staleWhileRevalidate);
+        var many = BuildCache(o => o.StaleWhileRevalidate = staleWhileRevalidate);
+        var singleKeys = await SeedAsync(single, staleWhileRevalidate);
+        var manyKeys = await SeedAsync(many, staleWhileRevalidate);
+
+        //Act
+        var expected = new List<string>();
+        foreach (var key in singleKeys)
+        {
+            expected.Add(await single.Cache.PeekAsync<string>(key));
+        }
+
+        var result = await many.Cache.PeekManyAsync<string>(manyKeys);
+
+        //Assert
+        result.Select(x => x.Data).Should().Equal(expected);
+        result.Select(x => x.Data).Should().Equal("fresh", null, staleWhileRevalidate ? "stale" : null);
+        many.Persist.GetManyCalls.Should().Be(1);
+        many.Persist.GetCalls.Should().Be(0);
+        many.Persist.CompletedTouches.Should().Be(single.Persist.CompletedTouches);
+    }
+
+    private async Task<Key[]> SeedAsync(RecordingCache sut, bool staleWhileRevalidate)
+    {
+        Key[] keys = [NewKey(), NewKey(), NewKey()];
+        await sut.Cache.SetAsync(keys[0], "fresh");
+        var staleItem = BuildItem("stale") with { CreateTime = DateTime.UtcNow.AddHours(-1) };
+        await sut.Persist.SetAsync(StoredKey(keys[2]), staleItem, staleWhileRevalidate);
+        return keys;
+    }
+
     private RecordingCache BuildCache(Action<CacheTypeOptions> typeOptions = null)
     {
         return RecordingCacheFactory.Create<string>(typeOptions: o =>

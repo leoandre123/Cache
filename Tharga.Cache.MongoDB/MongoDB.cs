@@ -38,26 +38,57 @@ internal class MongoDB : IMongoDB
         var collection = GetCollection();
 
         var item = await collection.GetOneAsync(key.Value);
-        if (item != null)
-        {
-            if (!item.StaleWhileRevalidate && item.FreshSpan.HasValue && item.FreshSpan.Value != TimeSpan.MaxValue && item.CreateTime.Add(item.FreshSpan.Value) < DateTime.UtcNow)
-            {
-                await collection.DeleteOneAsync(ById(item.Id));
-                return null;
-            }
+        return await ToCacheItemAsync<T>(collection, key, item);
+    }
 
-            return new CacheItem<T>()
-            {
-                KeyParts = key.KeyParts,
-                CreateTime = item.CreateTime,
-                Data = JsonSerializer.Deserialize<T>(item.Data),
-                FreshSpan = item.FreshSpan,
-                UpdateTime = item.UpdateTime,
-                LoadDuration = item.LoadDuration,
-            };
+    /// <summary>
+    /// Reads all keys with one find on the ids ($in).
+    /// </summary>
+    public async Task<IReadOnlyList<(Key Key, CacheItem<T> CacheItem)>> GetManyAsync<T>(IEnumerable<Key> keys)
+    {
+        var requestedKeys = keys.ToArray();
+        if (requestedKeys.Length == 0) return [];
+
+        var collection = GetCollection();
+        var keyById = requestedKeys.DistinctBy(x => x.Value).ToDictionary(x => x.Value);
+        var ids = keyById.Keys.ToArray();
+
+        var entities = new List<CacheEntity>();
+        await foreach (var entity in collection.GetAsync(new FilterDefinitionBuilder<CacheEntity>().In(x => x.Id, ids)))
+        {
+            entities.Add(entity);
         }
 
-        return null;
+        var items = new Dictionary<string, CacheItem<T>>();
+        foreach (var entity in entities)
+        {
+            if (!keyById.TryGetValue(entity.Id, out var key)) continue;
+
+            items[entity.Id] = await ToCacheItemAsync<T>(collection, key, entity);
+        }
+
+        return requestedKeys.Select(x => (x, items.GetValueOrDefault(x.Value))).ToArray();
+    }
+
+    private static async Task<CacheItem<T>> ToCacheItemAsync<T>(ICacheRepositoryCollection collection, Key key, CacheEntity item)
+    {
+        if (item == null) return null;
+
+        if (!item.StaleWhileRevalidate && item.FreshSpan.HasValue && item.FreshSpan.Value != TimeSpan.MaxValue && item.CreateTime.Add(item.FreshSpan.Value) < DateTime.UtcNow)
+        {
+            await collection.DeleteOneAsync(ById(item.Id));
+            return null;
+        }
+
+        return new CacheItem<T>()
+        {
+            KeyParts = key.KeyParts,
+            CreateTime = item.CreateTime,
+            Data = JsonSerializer.Deserialize<T>(item.Data),
+            FreshSpan = item.FreshSpan,
+            UpdateTime = item.UpdateTime,
+            LoadDuration = item.LoadDuration,
+        };
     }
 
     public IAsyncEnumerable<(Key Key, CacheItem<T> CacheItem)> FindAsync<T>(Key key)

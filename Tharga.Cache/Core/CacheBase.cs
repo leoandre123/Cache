@@ -7,6 +7,7 @@ namespace Tharga.Cache.Core;
 internal abstract class CacheBase : ICache, IDisposable
 {
     private const string BuyMoreTimeOperation = "buy-more-time";
+    private const string ReadManyOperation = "read-many";
 
     private readonly IManagedCacheMonitor _cacheMonitor;
     private readonly IPersistLoader _persistLoader;
@@ -112,18 +113,29 @@ internal abstract class CacheBase : ICache, IDisposable
         key = key.SetTypeKey<T>();
 
         var result = await TryGetPersistAsync<T>(key);
-        if (result.IsValid(_options.UtcNow))
-        {
-            var response = result.GetData();
-            await OnGetAsync(key, result);
+        return await ResolvePeekAsync(key, result);
+    }
 
-            return response;
-        }
+    public virtual async Task<IReadOnlyList<(Key Key, T Data)>> PeekManyAsync<T>(IEnumerable<Key> keys)
+    {
+        ArgumentNullException.ThrowIfNull(keys);
 
-        if (GetTypeOptions<T>().StaleWhileRevalidate && result != null)
+        var requestedKeys = keys.ToArray();
+        if (requestedKeys.Length == 0) return [];
+
+        var typedKeys = requestedKeys.Select(x => x.SetTypeKey<T>()).ToArray();
+        var items = await TryGetManyPersistAsync<T>(typedKeys);
+        var data = await Task.WhenAll(typedKeys.Select((key, index) => ResolvePeekAsync(key, items[index])));
+
+        return requestedKeys.Select((key, index) => (key, data[index])).ToArray();
+    }
+
+    private async Task<T> ResolvePeekAsync<T>(Key key, CacheItem<T> item)
+    {
+        if (item.IsValid(_options.UtcNow) || (GetTypeOptions<T>().StaleWhileRevalidate && item != null))
         {
-            var response = result.GetData();
-            await OnGetAsync(key, result);
+            var response = item.GetData();
+            await OnGetAsync(key, item);
 
             return response;
         }
@@ -336,6 +348,30 @@ internal abstract class CacheBase : ICache, IDisposable
             LogFailOpen(ex, "read", key, typeof(T));
             return null;
         }
+    }
+
+    /// <summary>
+    /// Reads several keys from the persist backend in one call. The result is aligned with <paramref name="keys"/>.
+    /// When <see cref="CacheOptions.FailOpenOnBackendError"/> is enabled, a backend exception is logged and every
+    /// key is treated as a miss. A persist that returns another number of items than keys breaks the
+    /// <see cref="IPersist.GetManyAsync{T}"/> contract, which is a programming error and is always thrown.
+    /// </summary>
+    private async Task<CacheItem<T>[]> TryGetManyPersistAsync<T>(Key[] keys)
+    {
+        IReadOnlyList<(Key Key, CacheItem<T> CacheItem)> result;
+        try
+        {
+            result = await GetPersist<T>().GetManyAsync<T>(keys);
+        }
+        catch (Exception ex) when (_options.FailOpenOnBackendError)
+        {
+            _logger?.LogWarning(ex, "Cache persist {Operation} failed for {Count} keys on type '{Type}'; failing open ({Message}).", ReadManyOperation, keys.Length, typeof(T).Name, ex.Message);
+            return new CacheItem<T>[keys.Length];
+        }
+
+        if (result.Count != keys.Length) throw new InvalidOperationException($"The persist returned {result.Count} items for {keys.Length} keys.");
+
+        return result.Select(x => x.CacheItem).ToArray();
     }
 
     /// <summary>

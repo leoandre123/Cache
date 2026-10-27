@@ -77,6 +77,40 @@ internal class Redis : IRedis
         });
     }
 
+    /// <summary>
+    /// Reads all keys with one MGET. On a cluster the keys are grouped by hash slot, one MGET per slot,
+    /// because a multi-key command cannot span slots.
+    /// </summary>
+    public async Task<IReadOnlyList<(Key Key, CacheItem<T> CacheItem)>> GetManyAsync<T>(IEnumerable<Key> keys)
+    {
+        var requestedKeys = keys.ToArray();
+        if (requestedKeys.Length == 0) return [];
+
+        return await _resiliencePolicy.ExecuteAsync<IReadOnlyList<(Key Key, CacheItem<T> CacheItem)>>(async () =>
+        {
+            var redisConnection = await GetConnection();
+            if (redisConnection.Multiplexer == null) return requestedKeys.Select(x => (x, (CacheItem<T>)null)).ToArray();
+
+            var db = redisConnection.Multiplexer.GetDatabase();
+            var values = new RedisValue[requestedKeys.Length];
+            var slots = requestedKeys
+                .Select((key, index) => (Key: (RedisKey)key.Value, Index: index))
+                .GroupBy(x => redisConnection.Multiplexer.HashSlot(x.Key))
+                .Select(x => x.ToArray());
+
+            await Task.WhenAll(slots.Select(async slot =>
+            {
+                var read = await db.StringGetAsync(slot.Select(x => x.Key).ToArray());
+                for (var i = 0; i < slot.Length; i++)
+                {
+                    values[slot[i].Index] = read[i];
+                }
+            }));
+
+            return requestedKeys.Select((key, index) => (key, (CacheItem<T>)Deserialize<T>(values[index]))).ToArray();
+        });
+    }
+
     public IAsyncEnumerable<(Key Key, CacheItem<T> CacheItem)> FindAsync<T>(Key key)
     {
         throw new NotImplementedException();

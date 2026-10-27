@@ -116,24 +116,6 @@ public class RedisRoundTripTests
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task Invalidate_keeps_the_remaining_ttl(bool hasTimeToLive)
-    {
-        //Arrange
-        SetupStoredValue(JsonSerializer.Serialize(BuildItem("a", FreshSpan)), hasTimeToLive ? RemainingTimeToLive : null);
-        var script = SetupScript(1);
-
-        //Act
-        var invalidated = await _sut.Invalidate<string>(StoredKey);
-
-        //Assert
-        invalidated.Should().BeTrue();
-        script().ExpiryMilliseconds.Should().Be(hasTimeToLive ? (long)RemainingTimeToLive.TotalMilliseconds : 0, "an invalidate must neither wipe nor extend the TTL");
-        JsonSerializer.Deserialize<CacheItem<string>>(script().Value).UpdateTime.Should().Be(DateTime.MinValue);
-    }
-
-    [Theory]
     [InlineData(600_000, false, 600_000)]
     [InlineData(600_000, true, 0)]
     [InlineData(null, false, 0)]

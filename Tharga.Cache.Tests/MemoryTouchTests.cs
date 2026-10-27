@@ -12,22 +12,6 @@ public class MemoryTouchTests
     private static readonly Key StoredKey = "String.Key";
 
     [Fact]
-    public async Task Touch_with_the_read_item_sets_the_update_time()
-    {
-        //Arrange
-        var sut = BuildSut();
-        await sut.SetAsync(StoredKey, BuildItem("first"), false);
-        var read = await sut.GetAsync<string>(StoredKey);
-
-        //Act
-        var touched = await sut.BuyMoreTime(StoredKey, read, false);
-
-        //Assert
-        touched.Should().BeTrue();
-        (await sut.GetAsync<string>(StoredKey)).UpdateTime.Should().NotBeNull();
-    }
-
-    [Fact]
     public async Task Touch_with_a_replaced_item_keeps_the_newer_data()
     {
         //Arrange

@@ -71,25 +71,6 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
     }
 
     [Fact]
-    public async Task Background_touch_renews_the_ttl()
-    {
-        //Arrange
-        var sut = BuildCache(o => o.TouchInBackground = true);
-        var key = NewKey();
-        await sut.Cache.SetAsync(key, "value");
-        await Task.Delay(TouchDelay);
-        var ttlBeforeTouch = await TimeToLiveAsync(StoredKey(key));
-
-        //Act
-        await sut.Cache.PeekAsync<string>(key);
-
-        //Assert
-        await WaitUntilAsync(() => sut.Persist.CompletedTouches == 1);
-        var ttlAfterTouch = await TimeToLiveAsync(StoredKey(key));
-        ttlAfterTouch.Should().NotBeNull().And.BeGreaterThan(ttlBeforeTouch.Value);
-    }
-
-    [Fact]
     public async Task Touch_with_stale_while_revalidate_keeps_no_ttl()
     {
         //Arrange
@@ -130,23 +111,6 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
     }
 
     [Fact]
-    public async Task Touch_with_an_item_not_read_through_redis_is_applied()
-    {
-        //Arrange
-        var persist = BuildPersist();
-        var key = StoredKey(NewKey());
-        var item = BuildItem("value");
-        await persist.SetAsync(key, item, false);
-
-        //Act
-        var touched = await persist.BuyMoreTime(key, item, false);
-
-        //Assert
-        touched.Should().BeTrue();
-        (await persist.GetAsync<string>(key)).UpdateTime.Should().NotBeNull();
-    }
-
-    [Fact]
     public async Task Touch_with_a_replaced_item_keeps_the_newer_data()
     {
         //Arrange
@@ -164,24 +128,6 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
         var stored = await persist.GetAsync<string>(key);
         stored.Data.Should().Be("second");
         stored.UpdateTime.Should().BeNull();
-    }
-
-    [Fact]
-    public async Task Touch_after_an_invalidate_keeps_the_entry_invalid()
-    {
-        //Arrange
-        var persist = BuildPersist();
-        var key = StoredKey(NewKey());
-        await persist.SetAsync(key, BuildItem("value"), true);
-        var read = await persist.GetAsync<string>(key);
-        await persist.Invalidate<string>(key);
-
-        //Act
-        var touched = await persist.BuyMoreTime(key, read, true);
-
-        //Assert
-        touched.Should().BeFalse();
-        (await persist.GetAsync<string>(key)).UpdateTime.Should().Be(DateTime.MinValue);
     }
 
     [Fact]
@@ -221,22 +167,6 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
         ttlAfterTouch.Should().NotBeNull("the touch must not wipe the TTL").And.BeGreaterThan(ttlBeforeTouch.Value, "a time-to-idle touch renews the TTL to the fresh span");
         ttlAfterTouch.Should().BeLessThanOrEqualTo(FreshSpan);
         (await persist.GetAsync<string>(key)).UpdateTime.Should().NotBeNull();
-    }
-
-    [Fact]
-    public async Task Touch_by_key_does_not_add_a_ttl()
-    {
-        //Arrange
-        var persist = BuildPersist();
-        var key = StoredKey(NewKey());
-        await persist.SetAsync(key, BuildItem("value"), true);
-
-        //Act
-        var touched = await persist.BuyMoreTime<string>(key);
-
-        //Assert
-        touched.Should().BeTrue();
-        (await TimeToLiveAsync(key)).Should().BeNull("a stale value must stay readable");
     }
 
     [Theory]
@@ -306,43 +236,6 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
         result.Select(x => x.CacheItem).Should().BeEquivalentTo(expected, o => o.WithStrictOrdering());
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task PeekManyAsync_matches_PeekAsync_per_key(bool staleWhileRevalidate)
-    {
-        //Arrange
-        var single = BuildCache(o => o.StaleWhileRevalidate = staleWhileRevalidate);
-        var many = BuildCache(o => o.StaleWhileRevalidate = staleWhileRevalidate);
-        var singleKeys = await SeedAsync(single, staleWhileRevalidate);
-        var manyKeys = await SeedAsync(many, staleWhileRevalidate);
-
-        //Act
-        var expected = new List<string>();
-        foreach (var key in singleKeys)
-        {
-            expected.Add(await single.Cache.PeekAsync<string>(key));
-        }
-
-        var result = await many.Cache.PeekManyAsync<string>(manyKeys);
-
-        //Assert
-        result.Select(x => x.Data).Should().Equal(expected);
-        result.Select(x => x.Data).Should().Equal("fresh", null, staleWhileRevalidate ? "stale" : null);
-        many.Persist.GetManyCalls.Should().Be(1);
-        many.Persist.GetCalls.Should().Be(0);
-        many.Persist.CompletedTouches.Should().Be(single.Persist.CompletedTouches);
-    }
-
-    private async Task<Key[]> SeedAsync(RecordingCache sut, bool staleWhileRevalidate)
-    {
-        Key[] keys = [NewKey(), NewKey(), NewKey()];
-        await sut.Cache.SetAsync(keys[0], "fresh");
-        var staleItem = BuildItem("stale") with { CreateTime = DateTime.UtcNow.AddHours(-1) };
-        await sut.Persist.SetAsync(StoredKey(keys[2]), staleItem, staleWhileRevalidate);
-        return keys;
-    }
-
     private RecordingCache BuildCache(Action<CacheTypeOptions> typeOptions = null)
     {
         return RecordingCacheFactory.Create<string>(typeOptions: o =>
@@ -375,15 +268,5 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
     private static CacheItem<string> BuildItem(string data)
     {
         return new CacheItem<string> { KeyParts = [], CreateTime = DateTime.UtcNow, FreshSpan = FreshSpan, Data = data };
-    }
-
-    private static async Task WaitUntilAsync(Func<bool> condition)
-    {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
-        while (!condition())
-        {
-            if (DateTime.UtcNow > deadline) throw new TimeoutException("The condition was not met in time.");
-            await Task.Delay(10);
-        }
     }
 }

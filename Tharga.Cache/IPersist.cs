@@ -8,6 +8,11 @@ public interface IPersist
     Task<bool> BuyMoreTime<T>(Key key);
 
     /// <summary>
+    /// Buys more time for an item the caller has just read, so the persist does not have to read it again.
+    /// </summary>
+    Task<bool> BuyMoreTime<T>(Key key, CacheItem<T> cacheItem, bool staleWhileRevalidate) => BuyMoreTime<T>(key);
+
+    /// <summary>
     /// Change the time for the record so that it becomes invalid, but keeps the value in cache.
     /// This is needed when using StaleWhileRevalidate.
     /// </summary>

@@ -116,7 +116,9 @@ internal class Redis : IRedis
 
     /// <summary>
     /// Writes the item that was just read back with a new update time, without reading it again. SET XX never recreates
-    /// a key that is gone; like the read-and-write it replaces, it is not atomic, so a value replaced in between is overwritten.
+    /// a key that is gone. It is not atomic: a value written between the read and this touch is overwritten with the
+    /// copy that was read. That window is wider than master's read-and-write, and with TouchInBackground it includes
+    /// the time until the background touch runs.
     /// </summary>
     public async Task<bool> BuyMoreTime<T>(Key key, CacheItem<T> cacheItem, bool staleWhileRevalidate)
     {

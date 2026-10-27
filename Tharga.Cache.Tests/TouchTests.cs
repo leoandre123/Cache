@@ -46,17 +46,19 @@ public class TouchTests
     }
 
     [Fact]
-    public async Task Hit_close_to_expiry_touches_by_key()
+    public async Task Stale_hit_touches_by_key()
     {
         //Arrange
-        var (cache, persist) = RecordingCacheFactory.Create<string>(o => o.DefaultFreshSpan = TimeSpan.FromSeconds(30));
-        await cache.SetAsync(CacheKey, Value);
+        var (cache, persist) = RecordingCacheFactory.Create<string>(o => o.StaleWhileRevalidate = true);
+        var stale = new CacheItem<string> { KeyParts = [], CreateTime = DateTime.UtcNow.AddHours(-1), FreshSpan = TimeSpan.FromMinutes(10), Data = Value };
+        await persist.SetAsync(((Key)CacheKey).SetTypeKey<string>(), stale, true);
 
         //Act
-        await cache.PeekAsync<string>(CacheKey);
+        var result = await cache.PeekAsync<string>(CacheKey);
 
         //Assert
-        persist.BuyMoreTimeWithItemCalls.Should().Be(0, "close to expiry another reader may be reloading the item");
+        result.Should().Be(Value, "stale-while-revalidate returns the stale value");
+        persist.BuyMoreTimeWithItemCalls.Should().Be(0, "a stale item may be reloading, so the copy that was read must not be written back");
         persist.BuyMoreTimeByKeyCalls.Should().Be(1);
     }
 

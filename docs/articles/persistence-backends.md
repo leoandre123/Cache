@@ -29,16 +29,18 @@ builder.Services.AddCache(o =>
 
 Entries are written with an expiry of their fresh span (none with stale-while-revalidate or without a fresh span). The time-to-idle touch renews it and an invalidate keeps what is left. `PeekManyAsync` reads all keys with a single `MGET` (one per hash slot on a cluster).
 
-### Lua scripting is required
+### Servers without Lua scripting
 
-The time-to-idle touch, and `InvalidateAsync` on a type with stale-while-revalidate, run a Lua script on the server (`EVAL`/`EVALSHA`). The connecting user must be allowed to run scripts (ACL category `@scripting`). Proxies and Redis-compatible servers that block Lua or do not implement it cannot run these operations. Reads, writes, drops, `PeekManyAsync` and invalidates without stale-while-revalidate do not use scripting.
+The time-to-idle touch, and `InvalidateAsync` on a type with stale-while-revalidate, run a Lua script on the server (`EVAL`/`EVALSHA`), so the compare and the write are one atomic step. Not every server allows that: an ACL user without the `@scripting` category, a proxy or managed service that does not implement `EVAL`/`EVALSHA`, or a Redis-compatible server without Lua. Reads, writes, drops, `PeekManyAsync` and invalidates without stale-while-revalidate do not use scripting.
 
-If scripting is not available:
+When the server rejects the script, the persist switches to a fallback within the same call, so the touch or invalidate still succeeds:
 
-- A time-to-idle hit with fail-open (`FailOpenOnBackendError`, the default) still returns the value, but logs a warning on every hit, and the entry is never renewed: it expires its fresh span after it was written. The failed script is retried first (`RetryCount`, with backoff), which adds that delay to every hit unless `TouchInBackground` is set.
-- A time-to-idle hit without fail-open throws; with `TouchInBackground` the failure is logged as an error instead.
-- The failures count toward the circuit breaker. `CircuitBreakerFailureThreshold` failed calls in a row open the circuit, and every Redis call then fails fast for `CircuitBreakerDuration`.
-- `InvalidateAsync` with stale-while-revalidate throws, with or without fail-open.
+- Detection is by the server's error: `NOPERM` for `EVAL`/`EVALSHA`/`SCRIPT`, an unknown or unsupported `EVAL`/`EVALSHA` command, a reply that says Lua or scripting is disabled or not supported, or a client command map that disables `EVAL`/`EVALSHA`. `NOSCRIPT`, timeouts and connection errors do not count and go through the retry and circuit-breaker policy as before.
+- The rejection is not retried and does not count toward the circuit breaker. A warning is logged once.
+- It is remembered per connection, so later calls go straight to the fallback. Every 10 minutes one call tries the script again, and the script is used again once the server allows it.
+- The fallback reads the current value (`GET`, with `PTTL` where the remaining expiry is needed; a value already read in the same call is not read again), compares it on the client with the value that was read, and only if it is unchanged writes it with `SET ... XX` and the same expiry the script would set.
+
+The fallback is **not atomic**: a write by another client in the round trip between the read and the `SET XX` is overwritten, so a concurrent update or invalidate can be lost. `XX` still guarantees that a dropped or expired key is never created again. Allow scripting for the connecting user (`+@scripting`) if that window matters.
 
 ### Keys without a TTL after upgrading
 

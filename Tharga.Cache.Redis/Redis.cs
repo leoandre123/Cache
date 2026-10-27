@@ -35,15 +35,32 @@ internal class Redis : IRedis
     private readonly RedisCacheOptions _options;
     private readonly ILogger<Redis> _logger;
     private readonly IAsyncPolicy _resiliencePolicy;
+    private readonly RedisScriptingAvailability _scripting;
     private IConnectionMultiplexer _redisConnection;
 
     public Redis(IServiceProvider serviceProvider, IHostEnvironment hostEnvironment, IManagedCacheMonitor cacheMonitor, IOptions<RedisCacheOptions> options, ILogger<Redis> logger)
+        : this(serviceProvider, hostEnvironment, cacheMonitor, options, logger, null, TimeProvider.System)
+    {
+    }
+
+    internal Redis(IServiceProvider serviceProvider, IHostEnvironment hostEnvironment, IManagedCacheMonitor cacheMonitor, IOptions<RedisCacheOptions> options, ILogger<Redis> logger, IConnectionMultiplexer redisConnection)
+        : this(serviceProvider, hostEnvironment, cacheMonitor, options, logger, redisConnection, TimeProvider.System)
+    {
+    }
+
+    /// <summary>
+    /// Lets tests pass a connection and control the clock that times the scripting re-probe. Not public, so
+    /// dependency injection always uses the first constructor.
+    /// </summary>
+    internal Redis(IServiceProvider serviceProvider, IHostEnvironment hostEnvironment, IManagedCacheMonitor cacheMonitor, IOptions<RedisCacheOptions> options, ILogger<Redis> logger, IConnectionMultiplexer redisConnection, TimeProvider timeProvider)
     {
         _serviceProvider = serviceProvider;
         _hostEnvironment = hostEnvironment;
         _options = options.Value;
         _logger = logger;
         _resiliencePolicy = RedisResiliencePolicy.Create(_options, logger);
+        _scripting = new RedisScriptingAvailability(timeProvider);
+        _redisConnection = redisConnection;
 
         cacheMonitor.RequestEvictEvent += async (_, e) =>
         {
@@ -56,12 +73,6 @@ internal class Redis : IRedis
 
             cacheMonitor.Drop(e.Type, e.Key);
         };
-    }
-
-    internal Redis(IServiceProvider serviceProvider, IHostEnvironment hostEnvironment, IManagedCacheMonitor cacheMonitor, IOptions<RedisCacheOptions> options, ILogger<Redis> logger, IConnectionMultiplexer redisConnection)
-        : this(serviceProvider, hostEnvironment, cacheMonitor, options, logger)
-    {
-        _redisConnection = redisConnection;
     }
 
     public async Task<CacheItem<T>> GetAsync<T>(Key key)
@@ -146,7 +157,8 @@ internal class Redis : IRedis
     /// Touches without reading again: one script call that writes the item with a new update time, only if the key
     /// still holds exactly the value that was read, and with the same expiry rule as <see cref="SetAsync{T}"/>.
     /// An item that was not read through this persist does not carry the stored value to fingerprint; it is read once
-    /// more and only touched if it is still the same entry.
+    /// more and only touched if it is still the same entry. Without scripting the compare-and-set falls back to
+    /// <see cref="CompareAndSetWithoutScriptAsync{T}"/>.
     /// </summary>
     public async Task<bool> BuyMoreTime<T>(Key key, CacheItem<T> cacheItem, bool staleWhileRevalidate)
     {
@@ -156,6 +168,7 @@ internal class Redis : IRedis
             if (redisConnection.Multiplexer == null) return false;
 
             var db = redisConnection.Multiplexer.GetDatabase();
+            var readInThisCall = false;
             if (cacheItem is not RedisCacheItem<T> { StoredValue: not null } read)
             {
                 read = Deserialize<T>(await db.StringGetAsync((string)key));
@@ -164,10 +177,12 @@ internal class Redis : IRedis
                     LogNotTouched(key);
                     return false;
                 }
+
+                readInThisCall = true;
             }
 
             var touched = read with { UpdateTime = DateTime.UtcNow };
-            return await CompareAndSetAsync(db, key, read.ComputeStoredValueHash(), Serialize<T>(touched), GetExpiry(read, staleWhileRevalidate));
+            return await CompareAndSetAsync(redisConnection.Multiplexer, db, key, read, readInThisCall, Serialize<T>(touched), GetExpiry(read, staleWhileRevalidate));
         });
     }
 
@@ -230,17 +245,70 @@ internal class Redis : IRedis
 
         var updatedCacheItem = cacheItem with { UpdateTime = updateTime };
         var expiry = GetUpdateExpiry(cacheItem, timeToLive, renewExpiry);
-        return await CompareAndSetAsync(db, key, cacheItem.ComputeStoredValueHash(), Serialize<T>(updatedCacheItem), expiry);
+        return await CompareAndSetAsync(redisConnection.Multiplexer, db, key, cacheItem, true, Serialize<T>(updatedCacheItem), expiry);
     }
 
-    private async Task<bool> CompareAndSetAsync(IDatabase db, Key key, string storedValueHash, string value, TimeSpan? expiry)
+    /// <summary>
+    /// Writes <paramref name="value"/> only if the key still holds the stored value of <paramref name="read"/>. Runs
+    /// the compare-and-set script, unless the server rejects scripting: then the same call continues with the fallback,
+    /// so the rejection never reaches the resilience policy (it is neither retried nor counted by the circuit breaker),
+    /// and later calls on the connection go straight to the fallback.
+    /// </summary>
+    private async Task<bool> CompareAndSetAsync<T>(IConnectionMultiplexer connection, IDatabase db, Key key, RedisCacheItem<T> read, bool readInThisCall, string value, TimeSpan? expiry)
     {
         var expiryMilliseconds = expiry.HasValue ? Math.Max(1, (long)Math.Ceiling(expiry.Value.TotalMilliseconds)) : 0;
-        var result = await db.ScriptEvaluateAsync(CompareAndSetScript, [(string)key], [storedValueHash, value, expiryMilliseconds]);
-        if ((int)result == 1) return true;
+        bool written;
+        if (_scripting.ShouldTryScript(connection))
+        {
+            try
+            {
+                var result = await db.ScriptEvaluateAsync(CompareAndSetScript, [(string)key], [read.ComputeStoredValueHash(), value, expiryMilliseconds]);
+                if (_scripting.MarkAvailable()) _logger?.LogInformation("Redis runs Lua scripts again; touches and invalidates use the atomic compare-and-set script.");
+                written = (int)result == 1;
+            }
+            catch (Exception e) when (RedisScriptingErrors.IsScriptingUnavailable(e))
+            {
+                LogScriptingUnavailable(connection, e);
+                written = await CompareAndSetWithoutScriptAsync(db, key, read, readInThisCall, value, expiryMilliseconds);
+            }
+        }
+        else
+        {
+            written = await CompareAndSetWithoutScriptAsync(db, key, read, readInThisCall, value, expiryMilliseconds);
+        }
 
-        LogNotTouched(key);
-        return false;
+        if (!written) LogNotTouched(key);
+        return written;
+    }
+
+    /// <summary>
+    /// The compare-and-set for a server that does not run Lua: the stored value is compared on the client, then
+    /// written with <c>SET XX</c> and the same expiry as the script. When the value was read in this call, that read is
+    /// the comparison and it is not read again. Not atomic: a write by another client between the read and the <c>SET</c> is overwritten with the
+    /// value that was read, plus the new update time. <c>XX</c> still means a key that was dropped is not created again.
+    /// </summary>
+    private static async Task<bool> CompareAndSetWithoutScriptAsync<T>(IDatabase db, Key key, RedisCacheItem<T> read, bool readInThisCall, string value, long expiryMilliseconds)
+    {
+        if (!readInThisCall)
+        {
+            var current = await db.StringGetAsync((string)key);
+            if (current.IsNull || !((byte[])current).AsSpan().SequenceEqual(read.StoredValue)) return false;
+        }
+
+        var expiry = expiryMilliseconds > 0 ? TimeSpan.FromMilliseconds(expiryMilliseconds) : (TimeSpan?)null;
+        return await db.StringSetAsync((string)key, value, expiry, false, When.Exists);
+    }
+
+    private void LogScriptingUnavailable(IConnectionMultiplexer connection, Exception exception)
+    {
+        if (_scripting.MarkUnavailable(connection))
+        {
+            _logger?.LogWarning("Redis rejects Lua scripting ({Message}). Touches and invalidates use a non-atomic GET and SET XX fallback instead of the compare-and-set script; scripting is tried again every {ReprobeInterval}.", exception.Message, RedisScriptingAvailability.ReprobeInterval);
+        }
+        else
+        {
+            _logger?.LogDebug("Redis still rejects Lua scripting ({Message}); the fallback stays in use.", exception.Message);
+        }
     }
 
     private void LogNotTouched(Key key)

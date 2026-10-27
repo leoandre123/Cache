@@ -177,7 +177,7 @@ builder.Services.AddCache(o =>
 });
 ```
 
-The time-to-idle touch, and `InvalidateAsync` on a type with stale-while-revalidate, run a Lua script, so the server must allow `EVAL`/`EVALSHA` (ACL category `@scripting`); some proxies and Redis-compatible servers block Lua or do not implement it. Without it, a time-to-idle hit with fail-open logs a warning and the entry is no longer renewed, a hit without fail-open throws, and that invalidate throws. Keys touched or invalidated by earlier versions were left without a TTL and are not reclaimed by upgrading; delete them once. The Tharga.Cache.Redis package README has the details and a cleanup script.
+The time-to-idle touch, and `InvalidateAsync` on a type with stale-while-revalidate, run an atomic Lua compare-and-set (`EVAL`/`EVALSHA`). When the server rejects scripting (an ACL user without `@scripting`, a proxy or Redis-compatible server without Lua), the persist detects it, logs a warning once and switches to a `GET` + `SET XX` fallback in the same call, without retries or circuit-breaker failures. The fallback is not atomic: a concurrent write between the read and the `SET XX` can be overwritten, though a dropped key is never recreated. Keys touched or invalidated by earlier versions were left without a TTL and are not reclaimed by upgrading; delete them once. The Tharga.Cache.Redis package README has the details and a cleanup script.
 
 ### MongoDB
 

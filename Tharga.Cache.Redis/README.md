@@ -56,20 +56,22 @@ o.AddRedisDBOptions(r =>
 ## Expiry, time-to-idle and batch reads
 
 - Entries are written with a Redis expiry of their fresh span. There is no expiry for entries without a fresh span, for eternal entries, or with stale-while-revalidate, because the stale value must stay readable.
-- On an `ITimeToIdleCache` hit, the touch is one script call. It writes the entry with a new update time and renews the expiry, but only if the key still holds exactly the value that was read (the script compares a SHA1 of the stored value, so a different shape of the type in another deployment does not stop the touch). A value replaced or invalidated in between is left alone. Set `TouchInBackground` on the type to run the touch off the caller's path.
+- On an `ITimeToIdleCache` hit, the touch is one script call. It writes the entry with a new update time and renews the expiry, but only if the key still holds exactly the value that was read (the script compares a SHA1 of the stored value, so a different shape of the type in another deployment does not stop the touch). A value replaced or invalidated in between is left alone. Set `TouchInBackground` on the type to run the touch off the caller's path. A server that does not run Lua scripts gets a non-atomic fallback; see below.
 - `InvalidateAsync` keeps the remaining expiry; it neither removes nor extends it.
 - `PeekManyAsync` reads all keys with a single `MGET`, or one per hash slot on a cluster.
 
-## Lua scripting is required
+## Servers without Lua scripting
 
-The time-to-idle touch, and `InvalidateAsync` on a type with stale-while-revalidate, run a Lua script on the server (`EVAL`/`EVALSHA`). The connecting user must be allowed to run scripts: with Redis ACLs that is the `@scripting` category. Proxies and Redis-compatible servers that block Lua or do not implement it cannot run these operations. Reads, writes, drops, `PeekManyAsync` and invalidates without stale-while-revalidate (they delete the key) do not use scripting.
+The time-to-idle touch, and `InvalidateAsync` on a type with stale-while-revalidate, run a Lua script on the server (`EVAL`/`EVALSHA`), so the compare and the write are one atomic step. Not every server allows that: an ACL user without the `@scripting` category, a proxy or managed service that does not implement `EVAL`/`EVALSHA`, or a Redis-compatible server without Lua. Reads, writes, drops, `PeekManyAsync` and invalidates without stale-while-revalidate (they delete the key) do not use scripting.
 
-If scripting is not available:
+When the server rejects the script, the persist switches to a fallback within the same call, so the touch or invalidate still succeeds:
 
-- **A time-to-idle hit with fail-open** (`FailOpenOnBackendError`, on by default) still returns the value, but the touch fails and is logged as a warning on every hit. The entry is never renewed, so it expires its fresh span after it was written, like a time-to-live entry. The failed script is retried first (`RetryCount`, with backoff), which adds that delay to every hit unless `TouchInBackground` is set.
-- **A time-to-idle hit without fail-open** throws. With `TouchInBackground` the failure is logged as an error instead.
-- The failures count toward the circuit breaker. `CircuitBreakerFailureThreshold` failed calls in a row open the circuit, and every Redis call then fails fast for `CircuitBreakerDuration` (served as misses with fail-open).
-- **`InvalidateAsync` with stale-while-revalidate** throws, with or without fail-open.
+- **Detection** is by the server's error: `NOPERM` for `EVAL`/`EVALSHA`/`SCRIPT`, an unknown or unsupported `EVAL`/`EVALSHA` command, a reply that says Lua or scripting is disabled or not supported, or a client command map that disables `EVAL`/`EVALSHA`. `NOSCRIPT` (StackExchange.Redis loads the script again), timeouts and connection errors do not count; they go through the retry and circuit-breaker policy as before.
+- **No retry, no breaker.** The rejection is handled before the resilience policy sees it: it is not retried and does not count toward the circuit breaker. A warning is logged once.
+- **Remembered per connection.** Later calls go straight to the fallback, without a failed script call first. Every 10 minutes one call tries the script again; if the server allows it by then, an information message is logged and the script is used again. A new connection starts with the script.
+- **Fallback.** The current value is read (`GET`, pipelined with `PTTL` where the remaining expiry is needed; a value already read in the same call is not read again), compared on the client with the value that was read, and only if it is unchanged written with `SET ... XX` and the same expiry the script would set.
+
+The fallback is **not atomic**. Between the read and the `SET XX` there is one round trip in which another client can write the key. Such a write (a new value, an invalidate, another touch) is then overwritten by the value that was read plus the new update time: a concurrent update can be lost, and an entry invalidated in that window can be valid again until it is next refreshed or expires. `XX` still guarantees that a key that was dropped or has expired is never created again. If that window matters, allow scripting for the connecting user (for example `ACL SETUSER <user> +@scripting`).
 
 ## Keys without a TTL after upgrading
 

@@ -1,4 +1,6 @@
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
+using Moq;
 using Tharga.Cache.Tests.Helper;
 using Xunit;
 
@@ -7,6 +9,7 @@ namespace Tharga.Cache.Tests;
 public class TouchTests
 {
     private const string CacheKey = "Key";
+    private const string OtherCacheKey = "OtherKey";
     private const string Value = "value";
     private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
     private static readonly Key StoredKey = ((Key)CacheKey).SetTypeKey<string>();
@@ -112,6 +115,129 @@ public class TouchTests
     }
 
     [Fact]
+    public async Task Background_touch_does_not_hold_the_read_but_still_raises_events_and_monitors()
+    {
+        //Arrange
+        var sut = RecordingCacheFactory.Create<string>(typeOptions: o => o.TouchInBackground = true);
+        await sut.Cache.SetAsync(CacheKey, Value);
+        sut.Persist.TouchGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dataGetEventCount = 0;
+        var monitorGetEventCount = 0;
+        sut.Cache.DataGetEvent += (_, _) => dataGetEventCount++;
+        sut.Monitor.DataGetEvent += (_, _) => monitorGetEventCount++;
+
+        //Act
+        var result = await sut.Cache.PeekAsync<string>(CacheKey).WaitAsync(WaitTimeout);
+
+        //Assert
+        result.Should().Be(Value);
+        dataGetEventCount.Should().Be(1);
+        monitorGetEventCount.Should().Be(1, "the monitor's access bookkeeping happens before the read returns");
+        sut.Persist.CompletedTouches.Should().Be(0, "the touch is still held open");
+
+        sut.Persist.TouchGate.SetResult();
+        await WaitUntilAsync(() => sut.Persist.CompletedTouches == 1);
+        var stored = await sut.Persist.GetAsync<string>(StoredKey);
+        stored.UpdateTime.Should().NotBeNull("the background touch was applied");
+    }
+
+    [Fact]
+    public async Task Background_touch_is_not_started_again_while_one_is_pending_for_the_key()
+    {
+        //Arrange
+        var sut = RecordingCacheFactory.Create<string>(typeOptions: o => o.TouchInBackground = true);
+        await sut.Cache.SetAsync(CacheKey, Value);
+        await sut.Cache.SetAsync(OtherCacheKey, Value);
+        sut.Persist.TouchGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        //Act
+        await sut.Cache.PeekAsync<string>(CacheKey);
+        await WaitUntilAsync(() => sut.Persist.BuyMoreTimeWithItemCalls == 1);
+        await sut.Cache.PeekAsync<string>(CacheKey);
+        await sut.Cache.PeekAsync<string>(CacheKey);
+        await sut.Cache.PeekAsync<string>(OtherCacheKey);
+        await WaitUntilAsync(() => sut.Persist.BuyMoreTimeWithItemCalls == 2);
+
+        //Assert
+        sut.Persist.TouchGate.SetResult();
+        await WaitUntilAsync(() => sut.Persist.CompletedTouches == 2);
+        sut.Persist.BuyMoreTimeWithItemCalls.Should().Be(2, "one touch per key while it is pending, another key is not held up");
+
+        sut.Persist.TouchGate = null;
+        await WaitUntilAsync(async () =>
+        {
+            await sut.Cache.PeekAsync<string>(CacheKey);
+            return sut.Persist.CompletedTouches >= 3;
+        });
+    }
+
+    [Fact]
+    public async Task Background_touch_is_not_started_after_the_cache_is_disposed()
+    {
+        //Arrange
+        var sut = RecordingCacheFactory.Create<string>(typeOptions: o => o.TouchInBackground = true);
+        await sut.Cache.SetAsync(CacheKey, Value);
+        ((IDisposable)sut.Cache).Dispose();
+
+        //Act
+        var result = await sut.Cache.PeekAsync<string>(CacheKey);
+
+        //Assert
+        result.Should().Be(Value);
+        await Task.Delay(TimeSpan.FromMilliseconds(100));
+        sut.Persist.BuyMoreTimeWithItemCalls.Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData(true, LogLevel.Warning)]
+    [InlineData(false, LogLevel.Error)]
+    public async Task Background_touch_failure_is_logged_and_never_reaches_the_caller(bool failOpen, LogLevel expectedLevel)
+    {
+        //Arrange
+        var logger = new Mock<ILogger>();
+        var logged = new TaskCompletionSource<LogLevel>(TaskCreationOptions.RunContinuationsAsynchronously);
+        logger.Setup(x => x.Log(It.IsAny<LogLevel>(), It.IsAny<EventId>(), It.IsAny<It.IsAnyType>(), It.IsAny<Exception>(), It.IsAny<Func<It.IsAnyType, Exception, string>>()))
+            .Callback(new InvocationAction(x => logged.TrySetResult((LogLevel)x.Arguments[0])));
+        var sut = RecordingCacheFactory.Create<string>(typeOptions: o => o.TouchInBackground = true, failOpen: failOpen, logger: logger.Object);
+        await sut.Cache.SetAsync(CacheKey, Value);
+        sut.Persist.TouchException = new TimeoutException("Simulated backend timeout.");
+
+        //Act
+        var result = await sut.Cache.PeekAsync<string>(CacheKey);
+
+        //Assert
+        result.Should().Be(Value);
+        (await logged.Task.WaitAsync(WaitTimeout)).Should().Be(expectedLevel);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Hit_does_not_touch_an_item_touched_within_MinTimeBetweenTouches(bool touchInBackground)
+    {
+        //Arrange
+        var sut = RecordingCacheFactory.Create<string>(typeOptions: o =>
+        {
+            o.MinTimeBetweenTouches = TimeSpan.FromMinutes(1);
+            o.TouchInBackground = touchInBackground;
+        });
+        await sut.Cache.SetAsync(CacheKey, Value);
+        var older = new CacheItem<string> { KeyParts = [], CreateTime = DateTime.UtcNow.AddMinutes(-2), FreshSpan = TimeSpan.FromMinutes(10), Data = Value };
+        await sut.Persist.SetAsync(((Key)OtherCacheKey).SetTypeKey<string>(), older, false);
+
+        //Act
+        var recent = await sut.Cache.PeekAsync<string>(CacheKey);
+        var old = await sut.Cache.PeekAsync<string>(OtherCacheKey);
+
+        //Assert
+        recent.Should().Be(Value);
+        old.Should().Be(Value);
+        await WaitUntilAsync(() => sut.Persist.CompletedTouches == 1);
+        sut.Persist.BuyMoreTimeWithItemCalls.Should().Be(1, "only the item last written two minutes ago is touched");
+        (await sut.Persist.GetAsync<string>(StoredKey)).UpdateTime.Should().BeNull();
+    }
+
+    [Fact]
     public async Task Foreground_touch_failure_propagates_when_fail_open_is_disabled()
     {
         //Arrange
@@ -126,10 +252,15 @@ public class TouchTests
         await act.Should().ThrowAsync<TimeoutException>("the foreground touch keeps today's behaviour");
     }
 
-    private static async Task WaitUntilAsync(Func<bool> condition)
+    private static Task WaitUntilAsync(Func<bool> condition)
+    {
+        return WaitUntilAsync(() => Task.FromResult(condition()));
+    }
+
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition)
     {
         var deadline = DateTime.UtcNow + WaitTimeout;
-        while (!condition())
+        while (!await condition())
         {
             if (DateTime.UtcNow > deadline) throw new TimeoutException("The condition was not met in time.");
             await Task.Delay(10);

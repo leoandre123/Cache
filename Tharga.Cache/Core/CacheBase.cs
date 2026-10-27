@@ -1,9 +1,10 @@
-﻿using Microsoft.Extensions.Logging;
+﻿using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
 using Tharga.Cache.Persist;
 
 namespace Tharga.Cache.Core;
 
-internal abstract class CacheBase : ICache
+internal abstract class CacheBase : ICache, IDisposable
 {
     private const string BuyMoreTimeOperation = "buy-more-time";
 
@@ -12,6 +13,8 @@ internal abstract class CacheBase : ICache
     private readonly IFetchQueue _fetchQueue;
     private readonly ILogger _logger;
     protected readonly CacheOptions _options;
+    private readonly ConcurrentDictionary<string, byte> _pendingBackgroundTouches = new(StringComparer.OrdinalIgnoreCase);
+    private volatile bool _disposed;
 
     protected CacheBase(IManagedCacheMonitor cacheMonitor, IPersistLoader persistLoader, IFetchQueue fetchQueue, CacheOptions options, ILogger logger = null)
     {
@@ -22,6 +25,14 @@ internal abstract class CacheBase : ICache
         _fetchQueue = fetchQueue;
         _options = options;
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Stops new background touches from starting. The container disposes the cache when the host shuts down.
+    /// </summary>
+    public void Dispose()
+    {
+        _disposed = true;
     }
 
     public event EventHandler<DataSetEventArgs> DataSetEvent;
@@ -214,8 +225,17 @@ internal abstract class CacheBase : ICache
     {
         DataGetEvent?.Invoke(this, new DataGetEventArgs(key));
 
+        var typeOptions = GetTypeOptions<T>();
+        var touch = buyMoreTime && !WasTouchedRecently(item, typeOptions);
+        if (touch && typeOptions.TouchInBackground)
+        {
+            _cacheMonitor.Accessed(typeof(T), key, false);
+            BackgroundBuyMoreTime(key, item);
+            return;
+        }
+
         var moreTimeBought = false;
-        if (buyMoreTime)
+        if (touch)
         {
             try
             {
@@ -240,6 +260,47 @@ internal abstract class CacheBase : ICache
         if (item == null) return persist.BuyMoreTime<T>(key);
 
         return persist.BuyMoreTime(key, item, GetTypeOptions<T>().StaleWhileRevalidate);
+    }
+
+    private bool WasTouchedRecently(CacheItem item, CacheTypeOptions typeOptions)
+    {
+        if (item == null || typeOptions.MinTimeBetweenTouches is not { } minTimeBetweenTouches) return false;
+
+        return _options.UtcNow - (item.UpdateTime ?? item.CreateTime) < minTimeBetweenTouches;
+    }
+
+    /// <summary>
+    /// Runs the touch off the caller's critical path, at most one per key at a time, and none once the cache is
+    /// disposed. The exception cannot reach the caller, so it is always observed and logged: as a fail-open warning
+    /// when <see cref="CacheOptions.FailOpenOnBackendError"/> is on, otherwise as an error.
+    /// </summary>
+    private void BackgroundBuyMoreTime<T>(Key key, CacheItem<T> item)
+    {
+        if (_disposed) return;
+        if (!_pendingBackgroundTouches.TryAdd(key.Value, 0)) return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await BuyMoreTimeAsync(key, item);
+            }
+            catch (Exception ex)
+            {
+                if (_options.FailOpenOnBackendError)
+                {
+                    LogFailOpen(ex, BuyMoreTimeOperation, key, typeof(T));
+                }
+                else
+                {
+                    _logger?.LogError(ex, "Background cache persist {Operation} failed for key '{Key}' on type '{Type}' ({Message}).", BuyMoreTimeOperation, key.Value, typeof(T).Name, ex.Message);
+                }
+            }
+            finally
+            {
+                _pendingBackgroundTouches.TryRemove(key.Value, out _);
+            }
+        });
     }
 
     private void OnDrop<T>(Key key)

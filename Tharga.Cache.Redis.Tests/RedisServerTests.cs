@@ -71,6 +71,25 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
     }
 
     [Fact]
+    public async Task Background_touch_renews_the_ttl()
+    {
+        //Arrange
+        var sut = BuildCache(o => o.TouchInBackground = true);
+        var key = NewKey();
+        await sut.Cache.SetAsync(key, "value");
+        await Task.Delay(TouchDelay);
+        var ttlBeforeTouch = await TimeToLiveAsync(StoredKey(key));
+
+        //Act
+        await sut.Cache.PeekAsync<string>(key);
+
+        //Assert
+        await WaitUntilAsync(() => sut.Persist.CompletedTouches == 1);
+        var ttlAfterTouch = await TimeToLiveAsync(StoredKey(key));
+        ttlAfterTouch.Should().NotBeNull().And.BeGreaterThan(ttlBeforeTouch.Value);
+    }
+
+    [Fact]
     public async Task Touch_with_stale_while_revalidate_keeps_no_ttl()
     {
         //Arrange
@@ -296,5 +315,15 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
     private static CacheItem<string> BuildItem(string data)
     {
         return new CacheItem<string> { KeyParts = [], CreateTime = DateTime.UtcNow, FreshSpan = FreshSpan, Data = data };
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline) throw new TimeoutException("The condition was not met in time.");
+            await Task.Delay(10);
+        }
     }
 }

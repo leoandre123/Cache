@@ -46,6 +46,9 @@ var data = await cache.GetAsync<MyData>("key", () => FetchDataAsync());
 // Peek without triggering a load (returns default if not cached)
 var cached = await cache.PeekAsync<MyData>("key");
 
+// Peek many keys with one backend read (one MGET on Redis)
+var many = await cache.PeekManyAsync<MyData>(["key-1", "key-2"]);
+
 // Manually set a value
 await cache.SetAsync<MyData>("key", myData);
 
@@ -89,6 +92,7 @@ builder.Services.AddCache(o =>
 |--------|---------|-------------|
 | `DefaultFreshSpan` | `null` | Default TTL when not specified per call |
 | `StaleWhileRevalidate` | `false` | Return stale data immediately while refreshing in the background |
+| `TouchInBackground` | `false` | For `ITimeToIdleCache`: touch after a hit in the background, so the read returns after a single backend read |
 | `ReturnDefaultOnFirstLoad` | `false` | Return `default(T)` on first cache miss instead of blocking; factory runs in the background |
 | `MaxCount` | `null` | Maximum number of cached items for this type |
 | `MaxSize` | `null` | Maximum total size in bytes for this type |

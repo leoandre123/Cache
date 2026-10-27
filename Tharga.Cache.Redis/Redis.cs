@@ -68,7 +68,6 @@ internal class Redis : IRedis
             var redisConnection = await GetConnection();
             if (redisConnection.Multiplexer == null) return;
 
-            // One MGET per hash slot, since a cluster rejects an MGET across slots; a standalone server has a single slot.
             var db = redisConnection.Multiplexer.GetDatabase();
             foreach (var slot in requestedKeys.Select((key, index) => (Key: (RedisKey)(string)key, Index: index)).GroupBy(x => redisConnection.Multiplexer.HashSlot(x.Key)))
             {
@@ -114,12 +113,6 @@ internal class Redis : IRedis
         return await _resiliencePolicy.ExecuteAsync(async () => await SetUpdateTime<T>(key, DateTime.UtcNow));
     }
 
-    /// <summary>
-    /// Writes the item that was just read back with a new update time, without reading it again. SET XX never recreates
-    /// a key that is gone. It is not atomic: a value written between the read and this touch is overwritten with the
-    /// copy that was read. That window is wider than master's read-and-write, and with TouchInBackground it includes
-    /// the time until the background touch runs.
-    /// </summary>
     public async Task<bool> BuyMoreTime<T>(Key key, CacheItem<T> cacheItem, bool staleWhileRevalidate)
     {
         return await _resiliencePolicy.ExecuteAsync(async () =>
@@ -189,7 +182,6 @@ internal class Redis : IRedis
                 if (itemAgain != item) throw new InvalidOperationException("Failed to serialize/deserialize back to same result.");
             }
 
-            // A plain SET would remove the key's TTL. Keep none if it had none (stale-while-revalidate or eternal), renew it on a touch and keep what is left on an invalidate.
             var expiry = timeToLive == null || updateTime == DateTime.MinValue ? timeToLive : cacheItem.FreshSpan ?? timeToLive;
             return await db.StringSetAsync((string)key, item, expiry, When.Exists);
         }

@@ -260,8 +260,6 @@ internal abstract class CacheBase : ICache
 
     private Task<bool> BuyMoreTimeAsync<T>(Key key, CacheItem<T> item)
     {
-        // A stale item may be reloading right now (stale-while-revalidate starts the reload after the hit), so let the
-        // persist read it again instead of writing back the copy that was read.
         var persist = GetPersist<T>();
         if (item == null || !item.IsValid(_options.UtcNow)) return persist.BuyMoreTime<T>(key);
 

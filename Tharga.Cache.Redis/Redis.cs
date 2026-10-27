@@ -17,7 +17,7 @@ internal class Redis : IRedis
     private readonly RedisCacheOptions _options;
     private readonly ILogger<Redis> _logger;
     private readonly IAsyncPolicy _resiliencePolicy;
-    private ConnectionMultiplexer _redisConnection;
+    private IConnectionMultiplexer _redisConnection;
 
     public Redis(IServiceProvider serviceProvider, IHostEnvironment hostEnvironment, IManagedCacheMonitor cacheMonitor, IOptions<RedisCacheOptions> options, ILogger<Redis> logger)
     {
@@ -38,6 +38,12 @@ internal class Redis : IRedis
 
             cacheMonitor.Drop(e.Type, e.Key);
         };
+    }
+
+    internal Redis(IServiceProvider serviceProvider, IHostEnvironment hostEnvironment, IManagedCacheMonitor cacheMonitor, IOptions<RedisCacheOptions> options, ILogger<Redis> logger, IConnectionMultiplexer redisConnection)
+        : this(serviceProvider, hostEnvironment, cacheMonitor, options, logger)
+    {
+        _redisConnection = redisConnection;
     }
 
     public async Task<CacheItem<T>> GetAsync<T>(Key key)
@@ -68,37 +74,32 @@ internal class Redis : IRedis
     {
         await _resiliencePolicy.ExecuteAsync(async () =>
         {
-            var item = JsonSerializer.Serialize(cacheItem);
-            if (Debugger.IsAttached)
-            {
-                var convertedBack = JsonSerializer.Deserialize<CacheItem<T>>(item);
-                var itemAgain = JsonSerializer.Serialize(convertedBack);
-                if (itemAgain != item) throw new InvalidOperationException("Failed to serialize/deserialize back to same result.");
-            }
+            var item = Serialize(cacheItem);
 
             var redisConnection = await GetConnection();
             if (redisConnection.Multiplexer == null) return;
 
             var db = redisConnection.Multiplexer.GetDatabase();
-            if (cacheItem.FreshSpan == null || cacheItem.FreshSpan == TimeSpan.MaxValue || staleWhileRevalidate)
+            var expiry = GetExpiry(cacheItem, staleWhileRevalidate);
+            if (expiry == null)
             {
                 await db.StringSetAsync((string)key, item);
             }
             else
             {
-                await db.StringSetAsync((string)key, item, cacheItem.FreshSpan, false);
+                await db.StringSetAsync((string)key, item, expiry, false);
             }
         });
     }
 
     public async Task<bool> BuyMoreTime<T>(Key key)
     {
-        return await _resiliencePolicy.ExecuteAsync(async () => await SetUpdateTime<T>(key, DateTime.UtcNow));
+        return await _resiliencePolicy.ExecuteAsync(async () => await SetUpdateTime<T>(key, DateTime.UtcNow, renewExpiry: true));
     }
 
     public async Task<bool> Invalidate<T>(Key key)
     {
-        return await _resiliencePolicy.ExecuteAsync(async () => await SetUpdateTime<T>(key, DateTime.MinValue));
+        return await _resiliencePolicy.ExecuteAsync(async () => await SetUpdateTime<T>(key, DateTime.MinValue, renewExpiry: false));
     }
 
     public async Task<bool> DropAsync<T>(Key key)
@@ -132,33 +133,65 @@ internal class Redis : IRedis
         }
     }
 
-    private async Task<bool> SetUpdateTime<T>(Key key, DateTime updateTime)
+    /// <summary>
+    /// Read-and-write of the update time. The persist does not know the type's stale-while-revalidate flag here, so the
+    /// expiry follows the key's current state: a key without a TTL keeps having none, and a key with a TTL gets its
+    /// fresh span again when <paramref name="renewExpiry"/> is set (a touch) or keeps what is left otherwise (an
+    /// invalidate, which must not extend the entry's life).
+    /// </summary>
+    private async Task<bool> SetUpdateTime<T>(Key key, DateTime updateTime, bool renewExpiry)
     {
         var redisConnection = await GetConnection();
         if (redisConnection.Multiplexer == null) return false;
 
         var db = redisConnection.Multiplexer.GetDatabase();
-        var data = (await db.StringGetAsync((string)key)).ToString();
-        if (!string.IsNullOrEmpty(data))
-        {
-            var cacheItem = JsonSerializer.Deserialize<CacheItem<T>>(data);
-            var updatedCacheItem = cacheItem with { UpdateTime = updateTime };
-            var item = JsonSerializer.Serialize(updatedCacheItem);
-            if (Debugger.IsAttached)
-            {
-                var convertedBack = JsonSerializer.Deserialize<CacheItem<T>>(item);
-                var itemAgain = JsonSerializer.Serialize(convertedBack);
-                if (itemAgain != item) throw new InvalidOperationException("Failed to serialize/deserialize back to same result.");
-            }
 
-            await db.StringSetAsync((string)key, item);
-            return true;
-        }
+        // GET and PTTL are two pipelined commands in one round trip, not one atomic read.
+        var dataTask = db.StringGetAsync((string)key);
+        var timeToLiveTask = db.KeyTimeToLiveAsync((string)key);
+        var data = (await dataTask).ToString();
+        var timeToLive = await timeToLiveTask;
+        if (string.IsNullOrEmpty(data)) return false;
 
-        return false;
+        var cacheItem = JsonSerializer.Deserialize<CacheItem<T>>(data);
+        var updatedCacheItem = cacheItem with { UpdateTime = updateTime };
+        var expiry = GetUpdateExpiry(cacheItem, timeToLive, renewExpiry);
+        return await db.StringSetAsync((string)key, Serialize(updatedCacheItem), expiry, false, When.Exists);
     }
 
-    private async Task<(ConnectionMultiplexer Multiplexer, string Message)> GetConnection()
+    private static TimeSpan? GetUpdateExpiry(CacheItem cacheItem, TimeSpan? timeToLive, bool renewExpiry)
+    {
+        if (timeToLive == null) return null;
+        if (!renewExpiry) return timeToLive;
+
+        return GetExpiry(cacheItem, false) ?? timeToLive;
+    }
+
+    /// <summary>
+    /// The expiry rule for a write: none for items without a fresh span, for eternal items and with
+    /// stale-while-revalidate (the stale value must stay readable); otherwise the fresh span from now.
+    /// </summary>
+    private static TimeSpan? GetExpiry(CacheItem cacheItem, bool staleWhileRevalidate)
+    {
+        if (cacheItem.FreshSpan == null || cacheItem.FreshSpan == TimeSpan.MaxValue || staleWhileRevalidate) return null;
+
+        return cacheItem.FreshSpan;
+    }
+
+    private static string Serialize<T>(CacheItem<T> cacheItem)
+    {
+        var item = JsonSerializer.Serialize(cacheItem);
+        if (Debugger.IsAttached)
+        {
+            var convertedBack = JsonSerializer.Deserialize<CacheItem<T>>(item);
+            var itemAgain = JsonSerializer.Serialize(convertedBack);
+            if (itemAgain != item) throw new InvalidOperationException("Failed to serialize/deserialize back to same result.");
+        }
+
+        return item;
+    }
+
+    private async Task<(IConnectionMultiplexer Multiplexer, string Message)> GetConnection()
     {
         if (_redisConnection?.IsConnected ?? false) return (_redisConnection, "Connected (Cached).");
 

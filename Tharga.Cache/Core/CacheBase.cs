@@ -5,6 +5,7 @@ namespace Tharga.Cache.Core;
 
 internal abstract class CacheBase : ICache
 {
+    private static readonly TimeSpan TouchWithReadItemMargin = TimeSpan.FromMinutes(1);
     private readonly IManagedCacheMonitor _cacheMonitor;
     private readonly IPersistLoader _persistLoader;
     private readonly IFetchQueue _fetchQueue;
@@ -260,8 +261,12 @@ internal abstract class CacheBase : ICache
 
     private Task<bool> BuyMoreTimeAsync<T>(Key key, CacheItem<T> item)
     {
+        // Close to expiry, or already stale, another reader may be reloading the item, so let the persist read it again
+        // instead of writing back the copy that was read.
         var persist = GetPersist<T>();
-        return item == null ? persist.BuyMoreTime<T>(key) : persist.BuyMoreTime(key, item, GetTypeOptions<T>().StaleWhileRevalidate);
+        if (item == null || !item.IsValid(_options.UtcNow + TouchWithReadItemMargin)) return persist.BuyMoreTime<T>(key);
+
+        return persist.BuyMoreTime(key, item, GetTypeOptions<T>().StaleWhileRevalidate);
     }
 
     private void OnDrop<T>(Key key)

@@ -50,7 +50,6 @@
 		<InternalsVisibleTo Include="Tharga.Cache.Tests" />
 		<InternalsVisibleTo Include="Tharga.Cache.MongoDB.Tests" />
 		<InternalsVisibleTo Include="Tharga.Cache.Redis.Tests" />
-		<InternalsVisibleTo Include="Tharga.Cache.File.Tests" />
 		<InternalsVisibleTo Include="DynamicProxyGenAssembly2" />
 	</ItemGroup>
 

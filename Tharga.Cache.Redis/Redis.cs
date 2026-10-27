@@ -59,6 +59,31 @@ internal class Redis : IRedis
         });
     }
 
+    public async Task<IReadOnlyList<(Key Key, CacheItem<T> CacheItem)>> GetManyAsync<T>(IEnumerable<Key> keys)
+    {
+        var requestedKeys = keys.ToArray();
+        var items = new CacheItem<T>[requestedKeys.Length];
+        await _resiliencePolicy.ExecuteAsync(async () =>
+        {
+            var redisConnection = await GetConnection();
+            if (redisConnection.Multiplexer == null) return;
+
+            // One MGET per hash slot, since a cluster rejects an MGET across slots; a standalone server has a single slot.
+            var db = redisConnection.Multiplexer.GetDatabase();
+            foreach (var slot in requestedKeys.Select((key, index) => (Key: (RedisKey)(string)key, Index: index)).GroupBy(x => redisConnection.Multiplexer.HashSlot(x.Key)))
+            {
+                var entries = slot.ToArray();
+                var values = await db.StringGetAsync(entries.Select(x => x.Key).ToArray());
+                for (var i = 0; i < entries.Length; i++)
+                {
+                    items[entries[i].Index] = values[i].IsNullOrEmpty ? null : JsonSerializer.Deserialize<CacheItem<T>>(values[i].ToString());
+                }
+            }
+        });
+
+        return requestedKeys.Select((key, index) => (key, items[index])).ToArray();
+    }
+
     public IAsyncEnumerable<(Key Key, CacheItem<T> CacheItem)> FindAsync<T>(Key key)
     {
         throw new NotImplementedException();

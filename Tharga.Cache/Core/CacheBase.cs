@@ -98,7 +98,32 @@ internal abstract class CacheBase : ICache
     {
         key = key.SetTypeKey<T>();
 
-        var result = await TryGetPersistAsync<T>(key);
+        return await ResolvePeekAsync(key, await TryGetPersistAsync<T>(key));
+    }
+
+    public virtual async Task<IReadOnlyList<(Key Key, T Data)>> PeekManyAsync<T>(IEnumerable<Key> keys)
+    {
+        var requestedKeys = keys.ToArray();
+        if (requestedKeys.Length == 0) return [];
+
+        var typedKeys = requestedKeys.Select(x => x.SetTypeKey<T>()).ToArray();
+        IReadOnlyList<(Key Key, CacheItem<T> CacheItem)> items;
+        try
+        {
+            items = await GetPersist<T>().GetManyAsync<T>(typedKeys);
+        }
+        catch (Exception ex) when (_options.FailOpenOnBackendError)
+        {
+            LogFailOpen(ex, "read", typedKeys[0], typeof(T));
+            items = typedKeys.Select(x => (x, (CacheItem<T>)null)).ToArray();
+        }
+
+        var data = await Task.WhenAll(typedKeys.Select((key, index) => ResolvePeekAsync(key, items[index].CacheItem)));
+        return requestedKeys.Select((key, index) => (key, data[index])).ToArray();
+    }
+
+    private async Task<T> ResolvePeekAsync<T>(Key key, CacheItem<T> result)
+    {
         if (result.IsValid(_options.UtcNow) || (GetTypeOptions<T>().StaleWhileRevalidate && result != null))
         {
             var response = result.GetData();

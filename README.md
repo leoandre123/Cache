@@ -109,6 +109,8 @@ Each hit "touches" the item to reset its clock. The touch reuses the item that w
 
 Set `TouchInBackground` on the type to take the write off the caller's path, and `MinTimeBetweenTouches` to skip the write for items that were touched recently (see [Per-Type Options](#per-type-options)).
 
+**Custom persists and test doubles.** A hit on an item read from the persist calls the item-aware `IPersist.BuyMoreTime<T>(key, item, staleWhileRevalidate)`; `BuyMoreTime<T>(key)` is only called when there is no read copy (after a load). A strict `IPersist` mock needs a setup for the item-aware overload. A loose mock returns its default (`false`) for it without running the interface's default implementation, so setups and verifications on `BuyMoreTime<T>(key)` no longer see those hits.
+
 ### IScopeCache
 
 A scoped cache instance, cleared at the end of the DI scope (e.g., per HTTP request). Data never expires within the scope.
@@ -174,6 +176,8 @@ builder.Services.AddCache(o =>
     o.RegisterType<SessionData, IRedis>();
 });
 ```
+
+The time-to-idle touch, and `InvalidateAsync` on a type with stale-while-revalidate, run a Lua script, so the server must allow `EVAL`/`EVALSHA` (ACL category `@scripting`); some proxies and Redis-compatible servers block Lua or do not implement it. Without it, a time-to-idle hit with fail-open logs a warning and the entry is no longer renewed, a hit without fail-open throws, and that invalidate throws. Keys touched or invalidated by earlier versions were left without a TTL and are not reclaimed by upgrading; delete them once. The Tharga.Cache.Redis package README has the details and a cleanup script.
 
 ### MongoDB
 

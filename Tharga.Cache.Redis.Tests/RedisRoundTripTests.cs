@@ -235,6 +235,23 @@ public class RedisRoundTripTests
         _logger.Verify(x => x.Log(LogLevel.Debug, It.IsAny<EventId>(), It.IsAny<It.IsAnyType>(), It.IsAny<Exception>(), It.IsAny<Func<It.IsAnyType, Exception, string>>()), Times.Once);
     }
 
+    [Fact]
+    public async Task Read_keeps_the_stored_bytes_and_the_fingerprint_is_their_sha1()
+    {
+        //Arrange
+        var stored = JsonSerializer.Serialize(BuildItem("a", FreshSpan));
+        SetupStoredValue(stored, null);
+
+        //Act
+        var read = await _sut.GetAsync<string>(StoredKey);
+
+        //Assert
+        var redisItem = read.Should().BeOfType<RedisCacheItem<string>>().Subject;
+        redisItem.StoredValue.Should().Equal(Encoding.UTF8.GetBytes(stored), "the read keeps the bytes and leaves hashing to a touch");
+        redisItem.ComputeStoredValueHash().Should().Be(Sha1(stored), "the script compares it with redis.sha1hex of the stored value");
+        JsonSerializer.Serialize(redisItem).Should().NotContain(nameof(RedisCacheItem<string>.StoredValue));
+    }
+
     private void SetupStoredValue(string stored, TimeSpan? timeToLive)
     {
         _database.Setup(x => x.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>())).ReturnsAsync(stored);

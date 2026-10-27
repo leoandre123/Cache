@@ -1,5 +1,4 @@
 ﻿using Microsoft.Extensions.Options;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using Microsoft.Extensions.Hosting;
@@ -9,11 +8,13 @@ namespace Tharga.Cache.File;
 
 internal class File : IFile
 {
+    private const int EntryLockStripeCount = 64;
+
     private readonly IFileService _fileService;
     private readonly IFileFormatService _fileFormatService;
     private readonly IHostEnvironment _hostEnvironment;
     private readonly FileCacheOptions _options;
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _entryLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim[] _entryLocks = Enumerable.Range(0, EntryLockStripeCount).Select(_ => new SemaphoreSlim(1, 1)).ToArray();
 
     public File(IManagedCacheMonitor cacheMonitor, IFileService fileService, IFileFormatService fileFormatService, IHostEnvironment hostEnvironment, IOptions<FileCacheOptions> options)
     {
@@ -116,6 +117,18 @@ internal class File : IFile
         return _fileService.CanConnectAsync(BuildFilename(Guid.NewGuid().ToString(), null, "txt"));
     }
 
+    internal int EntryLockCount => _entryLocks.Length;
+
+    /// <summary>
+    /// The stripe that guards an entry. The same type and key, in any letter case (file names are not case-sensitive on
+    /// every platform), always get the same stripe within this process; different keys share one only by hash collision.
+    /// </summary>
+    internal int GetEntryLockIndex<T>(Key key)
+    {
+        var hash = StringComparer.OrdinalIgnoreCase.GetHashCode($"{typeof(T).FullName}|{key.Value}");
+        return (int)((uint)hash % EntryLockStripeCount);
+    }
+
     private async Task<bool> SetUpdateTimeAsync<T>(Key key, DateTime updateTime)
     {
         var item = await GetAsync<T>(key);
@@ -137,11 +150,12 @@ internal class File : IFile
 
     /// <summary>
     /// Serializes the writes of one entry within this process, so a read-then-write cannot interleave with another
-    /// write of the same entry.
+    /// write of the same entry. The locks are a fixed set of stripes, so they do not grow with the number of keys.
+    /// Two keys can share a stripe, so an action must never take another entry's lock.
     /// </summary>
     private async Task<TResult> InEntryLockAsync<T, TResult>(Key key, Func<Task<TResult>> action)
     {
-        var entryLock = _entryLocks.GetOrAdd($"{typeof(T).FullName}|{key.Value}", _ => new SemaphoreSlim(1, 1));
+        var entryLock = _entryLocks[GetEntryLockIndex<T>(key)];
         await entryLock.WaitAsync();
         try
         {

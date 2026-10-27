@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -12,6 +13,24 @@ namespace Tharga.Cache.Redis;
 
 internal class Redis : IRedis
 {
+    /// <summary>
+    /// Writes ARGV[2] only if the key still holds the value whose SHA1 is ARGV[1], the value the caller read.
+    /// ARGV[3] is the expiry in milliseconds, or 0 for no expiry. Returns 1 if written, otherwise 0.
+    /// </summary>
+    private const string CompareAndSetScript = """
+        local current = redis.call('GET', KEYS[1])
+        if not current or redis.sha1hex(current) ~= ARGV[1] then
+            return 0
+        end
+        local expiry = tonumber(ARGV[3])
+        if expiry > 0 then
+            redis.call('SET', KEYS[1], ARGV[2], 'PX', expiry)
+        else
+            redis.call('SET', KEYS[1], ARGV[2])
+        end
+        return 1
+        """;
+
     private readonly IServiceProvider _serviceProvider;
     private readonly IHostEnvironment _hostEnvironment;
     private readonly RedisCacheOptions _options;
@@ -54,14 +73,7 @@ internal class Redis : IRedis
             if (redisConnection.Multiplexer == null) return null;
 
             var db = redisConnection.Multiplexer.GetDatabase();
-            var data = (await db.StringGetAsync((string)key)).ToString();
-            if (!string.IsNullOrEmpty(data))
-            {
-                var cacheItem = JsonSerializer.Deserialize<CacheItem<T>>(data);
-                return cacheItem;
-            }
-
-            return null;
+            return Deserialize<T>(await db.StringGetAsync((string)key));
         });
     }
 
@@ -95,6 +107,35 @@ internal class Redis : IRedis
     public async Task<bool> BuyMoreTime<T>(Key key)
     {
         return await _resiliencePolicy.ExecuteAsync(async () => await SetUpdateTime<T>(key, DateTime.UtcNow, renewExpiry: true));
+    }
+
+    /// <summary>
+    /// Touches without reading again: one script call that writes the item with a new update time, only if the key
+    /// still holds exactly the value that was read, and with the same expiry rule as <see cref="SetAsync{T}"/>.
+    /// An item that was not read through this persist carries no fingerprint of the stored value; it is read once
+    /// more and only touched if it is still the same entry.
+    /// </summary>
+    public async Task<bool> BuyMoreTime<T>(Key key, CacheItem<T> cacheItem, bool staleWhileRevalidate)
+    {
+        return await _resiliencePolicy.ExecuteAsync(async () =>
+        {
+            var redisConnection = await GetConnection();
+            if (redisConnection.Multiplexer == null) return false;
+
+            var db = redisConnection.Multiplexer.GetDatabase();
+            if (cacheItem is not RedisCacheItem<T> { StoredValueHash: not null } read)
+            {
+                read = Deserialize<T>(await db.StringGetAsync((string)key));
+                if (!read.IsSameEntryAs(cacheItem))
+                {
+                    LogNotTouched(key);
+                    return false;
+                }
+            }
+
+            var touched = read with { UpdateTime = DateTime.UtcNow };
+            return await CompareAndSetAsync(db, key, read.StoredValueHash, Serialize<T>(touched), GetExpiry(read, staleWhileRevalidate));
+        });
     }
 
     public async Task<bool> Invalidate<T>(Key key)
@@ -146,17 +187,32 @@ internal class Redis : IRedis
 
         var db = redisConnection.Multiplexer.GetDatabase();
 
-        // GET and PTTL are two pipelined commands in one round trip, not one atomic read.
+        // GET and PTTL are two pipelined commands in one round trip, not one atomic read; the compare-and-set below
+        // only writes if the value is still the one that was read.
         var dataTask = db.StringGetAsync((string)key);
         var timeToLiveTask = db.KeyTimeToLiveAsync((string)key);
-        var data = (await dataTask).ToString();
+        var cacheItem = Deserialize<T>(await dataTask);
         var timeToLive = await timeToLiveTask;
-        if (string.IsNullOrEmpty(data)) return false;
+        if (cacheItem == null) return false;
 
-        var cacheItem = JsonSerializer.Deserialize<CacheItem<T>>(data);
         var updatedCacheItem = cacheItem with { UpdateTime = updateTime };
         var expiry = GetUpdateExpiry(cacheItem, timeToLive, renewExpiry);
-        return await db.StringSetAsync((string)key, Serialize(updatedCacheItem), expiry, false, When.Exists);
+        return await CompareAndSetAsync(db, key, cacheItem.StoredValueHash, Serialize<T>(updatedCacheItem), expiry);
+    }
+
+    private async Task<bool> CompareAndSetAsync(IDatabase db, Key key, string storedValueHash, string value, TimeSpan? expiry)
+    {
+        var expiryMilliseconds = expiry.HasValue ? Math.Max(1, (long)Math.Ceiling(expiry.Value.TotalMilliseconds)) : 0;
+        var result = await db.ScriptEvaluateAsync(CompareAndSetScript, [(string)key], [storedValueHash, value, expiryMilliseconds]);
+        if ((int)result == 1) return true;
+
+        LogNotTouched(key);
+        return false;
+    }
+
+    private void LogNotTouched(Key key)
+    {
+        _logger?.LogDebug("Redis key '{Key}' was not updated: it was replaced, invalidated or removed after it was read.", key.Value);
     }
 
     private static TimeSpan? GetUpdateExpiry(CacheItem cacheItem, TimeSpan? timeToLive, bool renewExpiry)
@@ -189,6 +245,14 @@ internal class Redis : IRedis
         }
 
         return item;
+    }
+
+    private static RedisCacheItem<T> Deserialize<T>(RedisValue value)
+    {
+        if (value.IsNullOrEmpty) return null;
+
+        var cacheItem = JsonSerializer.Deserialize<RedisCacheItem<T>>((string)value);
+        return cacheItem == null ? null : cacheItem with { StoredValueHash = Convert.ToHexStringLower(SHA1.HashData((byte[])value)) };
     }
 
     private async Task<(IConnectionMultiplexer Multiplexer, string Message)> GetConnection()

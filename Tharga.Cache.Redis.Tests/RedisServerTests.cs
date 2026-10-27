@@ -4,12 +4,13 @@ using Microsoft.Extensions.Options;
 using Moq;
 using StackExchange.Redis;
 using Tharga.Cache.Core;
+using Tharga.Cache.Tests.Helper;
 using Xunit;
 
 namespace Tharga.Cache.Redis.Tests;
 
 /// <summary>
-/// Runs against a real Redis server, because the expiry rules are only observable on a server.
+/// Runs against a real Redis server, because the touch's compare-and-set and expiry are a server-side script.
 /// Set the connection string in the environment variable <see cref="RedisServerFixture.ConnectionStringVariable"/>
 /// to run them, preferably on a database of its own, e.g. "127.0.0.1:6379,defaultDatabase=15".
 /// Only keys created by the test are written and deleted.
@@ -43,6 +44,144 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
     private IDatabase Database => _connection.GetDatabase();
 
     private Task<TimeSpan?> TimeToLiveAsync(Key key) => Database.KeyTimeToLiveAsync(key.Value);
+
+    [Fact]
+    public async Task Time_to_idle_peek_touches_once_and_renews_the_ttl()
+    {
+        //Arrange
+        var sut = BuildCache();
+        var key = NewKey();
+        await sut.Cache.SetAsync(key, "value");
+        await Task.Delay(TouchDelay);
+        var ttlBeforeTouch = await TimeToLiveAsync(StoredKey(key));
+
+        //Act
+        var result = await sut.Cache.PeekAsync<string>(key);
+
+        //Assert
+        result.Should().Be("value");
+        sut.Persist.GetCalls.Should().Be(1);
+        sut.Persist.BuyMoreTimeByKeyCalls.Should().Be(0);
+        sut.Persist.CompletedTouches.Should().Be(1);
+        var ttlAfterTouch = await TimeToLiveAsync(StoredKey(key));
+        ttlBeforeTouch.Should().NotBeNull();
+        ttlAfterTouch.Should().NotBeNull("the touch must not wipe the TTL").And.BeGreaterThan(ttlBeforeTouch.Value, "a time-to-idle touch renews the TTL to the fresh span");
+        ttlAfterTouch.Should().BeLessThanOrEqualTo(FreshSpan);
+        (await sut.Persist.GetAsync<string>(StoredKey(key))).UpdateTime.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Touch_with_stale_while_revalidate_keeps_no_ttl()
+    {
+        //Arrange
+        var sut = BuildCache(o => o.StaleWhileRevalidate = true);
+        var key = NewKey();
+        await sut.Cache.SetAsync(key, "value");
+
+        //Act
+        await sut.Cache.PeekAsync<string>(key);
+
+        //Assert
+        sut.Persist.CompletedTouches.Should().Be(1);
+        (await TimeToLiveAsync(StoredKey(key))).Should().BeNull("a stale value must stay readable");
+    }
+
+    [Fact]
+    public async Task Touch_of_a_value_that_does_not_round_trip_is_applied()
+    {
+        //Arrange
+        var persist = BuildPersist();
+        var key = StoredKey(NewKey());
+        var createTime = DateTime.UtcNow;
+        var stored = $$"""{"Data":"value","Version":2,"KeyParts":{},"CreateTime":"{{createTime:O}}","FreshSpan":"00:10:00"}""";
+        await Database.StringSetAsync(key.Value, stored, FreshSpan);
+        await Task.Delay(TouchDelay);
+        var ttlBeforeTouch = await TimeToLiveAsync(key);
+        var read = await persist.GetAsync<string>(key);
+
+        //Act
+        var touched = await persist.BuyMoreTime(key, read, false);
+
+        //Assert
+        touched.Should().BeTrue("a different shape of the stored value, e.g. from another version of the type, must not stop the touch");
+        var after = await persist.GetAsync<string>(key);
+        after.UpdateTime.Should().NotBeNull();
+        after.Data.Should().Be("value");
+        (await TimeToLiveAsync(key)).Should().NotBeNull().And.BeGreaterThan(ttlBeforeTouch.Value);
+    }
+
+    [Fact]
+    public async Task Touch_with_an_item_not_read_through_redis_is_applied()
+    {
+        //Arrange
+        var persist = BuildPersist();
+        var key = StoredKey(NewKey());
+        var item = BuildItem("value");
+        await persist.SetAsync(key, item, false);
+
+        //Act
+        var touched = await persist.BuyMoreTime(key, item, false);
+
+        //Assert
+        touched.Should().BeTrue();
+        (await persist.GetAsync<string>(key)).UpdateTime.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Touch_with_a_replaced_item_keeps_the_newer_data()
+    {
+        //Arrange
+        var persist = BuildPersist();
+        var key = StoredKey(NewKey());
+        await persist.SetAsync(key, BuildItem("first"), false);
+        var read = await persist.GetAsync<string>(key);
+        await persist.SetAsync(key, BuildItem("second"), false);
+
+        //Act
+        var touched = await persist.BuyMoreTime(key, read, false);
+
+        //Assert
+        touched.Should().BeFalse();
+        var stored = await persist.GetAsync<string>(key);
+        stored.Data.Should().Be("second");
+        stored.UpdateTime.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Touch_after_an_invalidate_keeps_the_entry_invalid()
+    {
+        //Arrange
+        var persist = BuildPersist();
+        var key = StoredKey(NewKey());
+        await persist.SetAsync(key, BuildItem("value"), true);
+        var read = await persist.GetAsync<string>(key);
+        await persist.Invalidate<string>(key);
+
+        //Act
+        var touched = await persist.BuyMoreTime(key, read, true);
+
+        //Assert
+        touched.Should().BeFalse();
+        (await persist.GetAsync<string>(key)).UpdateTime.Should().Be(DateTime.MinValue);
+    }
+
+    [Fact]
+    public async Task Touch_of_a_dropped_key_does_not_recreate_it()
+    {
+        //Arrange
+        var persist = BuildPersist();
+        var key = StoredKey(NewKey());
+        await persist.SetAsync(key, BuildItem("value"), false);
+        var read = await persist.GetAsync<string>(key);
+        await persist.DropAsync<string>(key);
+
+        //Act
+        var touched = await persist.BuyMoreTime(key, read, false);
+
+        //Assert
+        touched.Should().BeFalse();
+        (await Database.KeyExistsAsync(key.Value)).Should().BeFalse();
+    }
 
     [Fact]
     public async Task Touch_by_key_renews_the_ttl()
@@ -123,6 +262,15 @@ public class RedisServerTests : IClassFixture<RedisServerFixture>, IAsyncLifetim
         //Assert
         touched.Should().BeFalse();
         (await Database.KeyExistsAsync(key.Value)).Should().BeFalse();
+    }
+
+    private RecordingCache BuildCache(Action<CacheTypeOptions> typeOptions = null)
+    {
+        return RecordingCacheFactory.Create<string>(typeOptions: o =>
+        {
+            o.DefaultFreshSpan = FreshSpan;
+            typeOptions?.Invoke(o);
+        }, innerPersist: BuildPersist);
     }
 
     private Redis BuildPersist(IManagedCacheMonitor cacheMonitor = null)

@@ -68,6 +68,12 @@ internal class Memory : IMemory
         return SetUpdateTimeAsync(key, _timeProvider.GetUtcNow().UtcDateTime);
     }
 
+    public Task<bool> BuyMoreTime<T>(Key key, CacheItem<T> cacheItem, bool staleWhileRevalidate)
+    {
+        var updatedItem = cacheItem with { UpdateTime = _timeProvider.GetUtcNow().UtcDateTime };
+        return Task.FromResult(_datas.TryUpdate(key, updatedItem, cacheItem));
+    }
+
     public Task<bool> Invalidate<T>(Key key)
     {
         return SetUpdateTimeAsync(key, DateTime.MinValue);

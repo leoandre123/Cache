@@ -9,8 +9,8 @@ internal class TimeToIdleCache : TimeCacheBase, ITimeToIdleCache
     {
     }
 
-    protected override Task OnGetAsync<T>(Key key)
+    protected override Task OnGetAsync<T>(Key key, CacheItem<T> item)
     {
-        return OnGetCoreAsync<T>(key, true);
+        return OnGetCoreAsync(key, item, true);
     }
 }

@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.Options;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using Microsoft.Extensions.Hosting;
@@ -12,6 +13,7 @@ internal class File : IFile
     private readonly IFileFormatService _fileFormatService;
     private readonly IHostEnvironment _hostEnvironment;
     private readonly FileCacheOptions _options;
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _entryLocks = new(StringComparer.OrdinalIgnoreCase);
 
     public File(IManagedCacheMonitor cacheMonitor, IFileService fileService, IFileFormatService fileFormatService, IHostEnvironment hostEnvironment, IOptions<FileCacheOptions> options)
     {
@@ -65,24 +67,48 @@ internal class File : IFile
 
     public async Task SetAsync<T>(Key key, CacheItem<T> item, bool staleWhileRevalidate)
     {
-        var response = _fileFormatService.Pack(item);
-        await _fileService.SetDataAsync(BuildFilename(key, typeof(T), response.FileExtension), response.Data);
+        await InEntryLockAsync<T, bool>(key, async () =>
+        {
+            var response = _fileFormatService.Pack(item);
+            await _fileService.SetDataAsync(BuildFilename(key, typeof(T), response.FileExtension), response.Data);
+            return true;
+        });
     }
 
     public Task<bool> BuyMoreTime<T>(Key key)
     {
-        return SetUpdateTimeAsync<T>(key, DateTime.UtcNow);
+        return InEntryLockAsync<T, bool>(key, () => SetUpdateTimeAsync<T>(key, DateTime.UtcNow));
+    }
+
+    /// <summary>
+    /// A local read is cheap, so the file is read again, and only touched if it is still the entry the caller read.
+    /// The read and the write happen under the entry's lock, so within this process a concurrent replace or
+    /// invalidate is left alone. Processes that share the cache folder do not share the lock.
+    /// </summary>
+    public Task<bool> BuyMoreTime<T>(Key key, CacheItem<T> cacheItem, bool staleWhileRevalidate)
+    {
+        return InEntryLockAsync<T, bool>(key, async () =>
+        {
+            var current = await GetAsync<T>(key);
+            if (!current.IsSameEntryAs(cacheItem)) return false;
+
+            await WriteUpdateTimeAsync(key, current, DateTime.UtcNow);
+            return true;
+        });
     }
 
     public Task<bool> Invalidate<T>(Key key)
     {
-        return SetUpdateTimeAsync<T>(key, DateTime.MinValue);
+        return InEntryLockAsync<T, bool>(key, () => SetUpdateTimeAsync<T>(key, DateTime.MinValue));
     }
 
     public Task<bool> DropAsync<T>(Key key)
     {
-        var fileExtension = _fileFormatService.GetFileExtensions(_options.Format);
-        return _fileService.DeleteDataAsync(BuildFilename(key, typeof(T), fileExtension));
+        return InEntryLockAsync<T, bool>(key, () =>
+        {
+            var fileExtension = _fileFormatService.GetFileExtensions(_options.Format);
+            return _fileService.DeleteDataAsync(BuildFilename(key, typeof(T), fileExtension));
+        });
     }
 
     public Task<(bool Success, string Message)> CanConnectAsync()
@@ -95,13 +121,36 @@ internal class File : IFile
         var item = await GetAsync<T>(key);
         if (item != null)
         {
-            var updatedItem = item with { UpdateTime = updateTime };
-            var response = _fileFormatService.Pack(updatedItem);
-            await _fileService.SetDataAsync(BuildFilename(key, typeof(T), response.FileExtension), response.Data);
+            await WriteUpdateTimeAsync(key, item, updateTime);
             return true;
         }
 
         return false;
+    }
+
+    private async Task WriteUpdateTimeAsync<T>(Key key, CacheItem<T> item, DateTime updateTime)
+    {
+        var updatedItem = item with { UpdateTime = updateTime };
+        var response = _fileFormatService.Pack(updatedItem);
+        await _fileService.SetDataAsync(BuildFilename(key, typeof(T), response.FileExtension), response.Data);
+    }
+
+    /// <summary>
+    /// Serializes the writes of one entry within this process, so a read-then-write cannot interleave with another
+    /// write of the same entry.
+    /// </summary>
+    private async Task<TResult> InEntryLockAsync<T, TResult>(Key key, Func<Task<TResult>> action)
+    {
+        var entryLock = _entryLocks.GetOrAdd($"{typeof(T).FullName}|{key.Value}", _ => new SemaphoreSlim(1, 1));
+        await entryLock.WaitAsync();
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            entryLock.Release();
+        }
     }
 
     private string BuildFilename(Key key, Type type, string fileExtension)

@@ -105,7 +105,7 @@ var session = await _ttiCache.GetAsync<SessionData>(
     TimeSpan.FromMinutes(30));
 ```
 
-Each hit "touches" the item to reset its clock. The touch reuses the item that was just read, so a hit is one read plus one write. With the built-in Memory, MongoDB and Redis backends the touch only applies if the stored item is still the one that was read, so a value replaced or invalidated in between is never overwritten; the File backend gives that guarantee within one process. A custom `IPersist` that does not implement the item-aware `BuyMoreTime` overload touches whatever is stored.
+Each hit "touches" the item to reset its clock. On the Memory and Redis backends the touch reuses the item that was just read, so a hit is one read plus one write, and it only applies if the stored item is still the one that was read, so a value replaced or invalidated in between is never overwritten. The MongoDB and File backends, and a custom `IPersist` that does not implement the item-aware `BuyMoreTime` overload, touch whatever is stored.
 
 Set `TouchInBackground` on the type to take the write off the caller's path (see [Per-Type Options](#per-type-options)).
 

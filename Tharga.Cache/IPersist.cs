@@ -28,8 +28,8 @@ public interface IPersist
     /// <summary>
     /// Buys more time for an item the caller has already read, so the persist does not have to read it again.
     /// Implementations should only apply the touch if the stored entry is still the one that was read, so a concurrent
-    /// replace or invalidate is not overwritten with older data; the built-in Memory, MongoDB and Redis persists do,
-    /// and File does within one process. Returns true if the entry was touched.
+    /// replace or invalidate is not overwritten with older data; the built-in Memory and Redis persists do.
+    /// Returns true if the entry was touched.
     /// The default implementation falls back to <see cref="BuyMoreTime{T}(Key)"/>, which touches whatever is stored
     /// and does not give that guarantee.
     /// </summary>

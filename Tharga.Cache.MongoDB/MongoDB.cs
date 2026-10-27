@@ -127,21 +127,6 @@ internal class MongoDB : IMongoDB
         return SetUpdateTime(key, DateTime.UtcNow);
     }
 
-    /// <summary>
-    /// Sets only the update time, and only on the entry that was read (same create time and update time), so a
-    /// concurrent replace or invalidate is left alone. One round trip, no read.
-    /// </summary>
-    public async Task<bool> BuyMoreTime<T>(Key key, CacheItem<T> cacheItem, bool staleWhileRevalidate)
-    {
-        var filterBuilder = new FilterDefinitionBuilder<CacheEntity>();
-        var filter = filterBuilder.And(ById(key.Value), filterBuilder.Eq(x => x.CreateTime, cacheItem.CreateTime), filterBuilder.Eq(x => x.UpdateTime, cacheItem.UpdateTime));
-        var update = new UpdateDefinitionBuilder<CacheEntity>().Set(x => x.UpdateTime, DateTime.UtcNow);
-
-        var collection = GetCollection();
-        var result = await collection.UpdateOneAsync(filter, update, OneOption<CacheEntity>.SingleOrDefault);
-        return result.Before != null;
-    }
-
     public Task<bool> Invalidate<T>(Key key)
     {
         return SetUpdateTime(key, DateTime.MinValue);

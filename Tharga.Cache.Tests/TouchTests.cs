@@ -210,33 +210,6 @@ public class TouchTests
         (await logged.Task.WaitAsync(WaitTimeout)).Should().Be(expectedLevel);
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Hit_does_not_touch_an_item_touched_within_MinTimeBetweenTouches(bool touchInBackground)
-    {
-        //Arrange
-        var sut = RecordingCacheFactory.Create<string>(typeOptions: o =>
-        {
-            o.MinTimeBetweenTouches = TimeSpan.FromMinutes(1);
-            o.TouchInBackground = touchInBackground;
-        });
-        await sut.Cache.SetAsync(CacheKey, Value);
-        var older = new CacheItem<string> { KeyParts = [], CreateTime = DateTime.UtcNow.AddMinutes(-2), FreshSpan = TimeSpan.FromMinutes(10), Data = Value };
-        await sut.Persist.SetAsync(((Key)OtherCacheKey).SetTypeKey<string>(), older, false);
-
-        //Act
-        var recent = await sut.Cache.PeekAsync<string>(CacheKey);
-        var old = await sut.Cache.PeekAsync<string>(OtherCacheKey);
-
-        //Assert
-        recent.Should().Be(Value);
-        old.Should().Be(Value);
-        await WaitUntilAsync(() => sut.Persist.CompletedTouches == 1);
-        sut.Persist.BuyMoreTimeWithItemCalls.Should().Be(1, "only the item last written two minutes ago is touched");
-        (await sut.Persist.GetAsync<string>(StoredKey)).UpdateTime.Should().BeNull();
-    }
-
     [Fact]
     public async Task Foreground_touch_failure_propagates_when_fail_open_is_disabled()
     {

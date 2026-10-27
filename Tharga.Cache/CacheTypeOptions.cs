@@ -29,13 +29,5 @@ public record CacheTypeOptions
     /// </summary>
     public bool TouchInBackground { get; set; }
 
-    /// <summary>
-    /// If this is set, an <see cref="ITimeToIdleCache"/> hit does not touch an item that was written or touched less
-    /// than this long ago, which saves a backend write on every hit of a hot key. The trade-off is precision: an item
-    /// can then expire up to this much earlier than its idle time after the last hit. Applies to foreground and
-    /// background touches. Default is null (every hit touches).
-    /// </summary>
-    public TimeSpan? MinTimeBetweenTouches { get; set; }
-
     internal Type PersistType { get; set; }
 }

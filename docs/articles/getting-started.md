@@ -94,7 +94,6 @@ builder.Services.AddCache(o =>
 | `StaleWhileRevalidate` | `false` | Return stale data immediately while refreshing in the background |
 | `ReturnDefaultOnFirstLoad` | `false` | Return `default(T)` on first cache miss instead of blocking; factory runs in the background |
 | `TouchInBackground` | `false` | For `ITimeToIdleCache`: run the touch after a hit in the background so the read returns after a single backend read; at most one pending touch per key, failures are logged |
-| `MinTimeBetweenTouches` | `null` | For `ITimeToIdleCache`: do not touch an item that was written or touched less than this long ago; saves a write per hit on hot keys, but the item can expire up to this much earlier |
 | `MaxCount` | `null` | Maximum number of cached items for this type |
 | `MaxSize` | `null` | Maximum total size in bytes for this type |
 | `EvictionPolicy` | `FirstInFirstOut` | Strategy when `MaxCount` or `MaxSize` is exceeded |

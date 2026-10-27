@@ -107,7 +107,7 @@ var session = await _ttiCache.GetAsync<SessionData>(
 
 Each hit "touches" the item to reset its clock. The touch reuses the item that was just read, so a hit is one read plus one write. With the built-in Memory, MongoDB and Redis backends the touch only applies if the stored item is still the one that was read, so a value replaced or invalidated in between is never overwritten; the File backend gives that guarantee within one process. A custom `IPersist` that does not implement the item-aware `BuyMoreTime` overload touches whatever is stored.
 
-Set `TouchInBackground` on the type to take the write off the caller's path, and `MinTimeBetweenTouches` to skip the write for items that were touched recently (see [Per-Type Options](#per-type-options)).
+Set `TouchInBackground` on the type to take the write off the caller's path (see [Per-Type Options](#per-type-options)).
 
 **Custom persists and test doubles.** A hit on an item read from the persist calls the item-aware `IPersist.BuyMoreTime<T>(key, item, staleWhileRevalidate)`; `BuyMoreTime<T>(key)` is only called when there is no read copy (after a load). A strict `IPersist` mock needs a setup for the item-aware overload. A loose mock returns its default (`false`) for it without running the interface's default implementation, so setups and verifications on `BuyMoreTime<T>(key)` no longer see those hits.
 
@@ -260,7 +260,6 @@ builder.Services.AddCache(o =>
 | `StaleWhileRevalidate` | `false` | Return stale data immediately while refreshing in the background |
 | `ReturnDefaultOnFirstLoad` | `false` | Return `default(T)` on first cache miss instead of blocking; factory runs in the background |
 | `TouchInBackground` | `false` | For `ITimeToIdleCache`: run the touch after a hit in the background so the read returns after a single backend read; at most one pending touch per key, failures are logged |
-| `MinTimeBetweenTouches` | `null` | For `ITimeToIdleCache`: do not touch an item that was written or touched less than this long ago; saves a write per hit on hot keys, but the item can expire up to this much earlier |
 | `MaxCount` | `null` | Maximum number of cached items for this type |
 | `MaxSize` | `null` | Maximum total size in bytes for this type |
 | `EvictionPolicy` | `FirstInFirstOut` | Strategy when `MaxCount` or `MaxSize` is exceeded |

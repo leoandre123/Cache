@@ -238,8 +238,7 @@ internal abstract class CacheBase : ICache, IDisposable
         DataGetEvent?.Invoke(this, new DataGetEventArgs(key));
 
         var typeOptions = GetTypeOptions<T>();
-        var touch = buyMoreTime && !WasTouchedRecently(item, typeOptions);
-        if (touch && typeOptions.TouchInBackground)
+        if (buyMoreTime && typeOptions.TouchInBackground)
         {
             _cacheMonitor.Accessed(typeof(T), key, false);
             BackgroundBuyMoreTime(key, item);
@@ -247,7 +246,7 @@ internal abstract class CacheBase : ICache, IDisposable
         }
 
         var moreTimeBought = false;
-        if (touch)
+        if (buyMoreTime)
         {
             try
             {
@@ -272,13 +271,6 @@ internal abstract class CacheBase : ICache, IDisposable
         if (item == null) return persist.BuyMoreTime<T>(key);
 
         return persist.BuyMoreTime(key, item, GetTypeOptions<T>().StaleWhileRevalidate);
-    }
-
-    private bool WasTouchedRecently(CacheItem item, CacheTypeOptions typeOptions)
-    {
-        if (item == null || typeOptions.MinTimeBetweenTouches is not { } minTimeBetweenTouches) return false;
-
-        return _options.UtcNow - (item.UpdateTime ?? item.CreateTime) < minTimeBetweenTouches;
     }
 
     /// <summary>

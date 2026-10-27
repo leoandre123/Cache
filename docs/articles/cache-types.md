@@ -51,12 +51,6 @@ To keep the write off the caller's path, opt in per type; the read then returns 
 o.RegisterType<SessionData, IRedis>(t => t.TouchInBackground = true);
 ```
 
-For hot keys, `MinTimeBetweenTouches` skips the touch of an item that was written or touched less than that long ago. That saves a write per hit, at the cost of precision: the item can expire up to that much earlier than its idle time after the last hit.
-
-```csharp
-o.RegisterType<SessionData, IRedis>(t => t.MinTimeBetweenTouches = TimeSpan.FromSeconds(30));
-```
-
 On Redis the touch runs an atomic Lua script. A server that does not allow scripting gets a non-atomic `SET XX` fallback instead; see [Persistence backends](persistence-backends.md#redis).
 
 **Custom persists and test doubles.** A hit on an item read from the persist calls the item-aware `IPersist.BuyMoreTime<T>(key, item, staleWhileRevalidate)`; `BuyMoreTime<T>(key)` is only called when there is no read copy (after a load). A strict `IPersist` mock needs a setup for the item-aware overload. A loose mock returns its default (`false`) for it without running the interface's default implementation, so setups and verifications on `BuyMoreTime<T>(key)` no longer see those hits.

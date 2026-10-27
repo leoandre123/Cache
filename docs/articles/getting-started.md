@@ -46,6 +46,9 @@ var data = await cache.GetAsync<MyData>("key", () => FetchDataAsync());
 // Peek without triggering a load (returns default if not cached)
 var cached = await cache.PeekAsync<MyData>("key");
 
+// Peek many keys with one backend read (one MGET on Redis); same result per key as PeekAsync, in the requested order
+var many = await cache.PeekManyAsync<MyData>(["key-1", "key-2", "key-3"]);
+
 // Manually set a value
 await cache.SetAsync<MyData>("key", myData);
 
@@ -90,6 +93,8 @@ builder.Services.AddCache(o =>
 | `DefaultFreshSpan` | `null` | Default TTL when not specified per call |
 | `StaleWhileRevalidate` | `false` | Return stale data immediately while refreshing in the background |
 | `ReturnDefaultOnFirstLoad` | `false` | Return `default(T)` on first cache miss instead of blocking; factory runs in the background |
+| `TouchInBackground` | `false` | For `ITimeToIdleCache`: run the touch after a hit in the background so the read returns after a single backend read; at most one pending touch per key, failures are logged |
+| `MinTimeBetweenTouches` | `null` | For `ITimeToIdleCache`: do not touch an item that was written or touched less than this long ago; saves a write per hit on hot keys, but the item can expire up to this much earlier |
 | `MaxCount` | `null` | Maximum number of cached items for this type |
 | `MaxSize` | `null` | Maximum total size in bytes for this type |
 | `EvictionPolicy` | `FirstInFirstOut` | Strategy when `MaxCount` or `MaxSize` is exceeded |

@@ -105,6 +105,10 @@ var session = await _ttiCache.GetAsync<SessionData>(
     TimeSpan.FromMinutes(30));
 ```
 
+Each hit "touches" the item to reset its clock. The touch reuses the item that was just read, so a hit is one read plus one write. With the built-in Memory, MongoDB and Redis backends the touch only applies if the stored item is still the one that was read, so a value replaced or invalidated in between is never overwritten; the File backend gives that guarantee within one process. A custom `IPersist` that does not implement the item-aware `BuyMoreTime` overload touches whatever is stored.
+
+Set `TouchInBackground` on the type to take the write off the caller's path, and `MinTimeBetweenTouches` to skip the write for items that were touched recently (see [Per-Type Options](#per-type-options)).
+
 ### IScopeCache
 
 A scoped cache instance, cleared at the end of the DI scope (e.g., per HTTP request). Data never expires within the scope.
@@ -125,6 +129,9 @@ var data = await cache.GetAsync<MyData>("key", () => FetchDataAsync());
 
 // Peek without triggering a load (returns default if not cached)
 var cached = await cache.PeekAsync<MyData>("key");
+
+// Peek many keys with one backend read (one MGET on Redis); same result per key as PeekAsync, in the requested order
+var many = await cache.PeekManyAsync<MyData>(["key-1", "key-2", "key-3"]);
 
 // Manually set a value
 await cache.SetAsync<MyData>("key", myData);
@@ -248,6 +255,8 @@ builder.Services.AddCache(o =>
 | `DefaultFreshSpan` | `null` | Default TTL when not specified per call |
 | `StaleWhileRevalidate` | `false` | Return stale data immediately while refreshing in the background |
 | `ReturnDefaultOnFirstLoad` | `false` | Return `default(T)` on first cache miss instead of blocking; factory runs in the background |
+| `TouchInBackground` | `false` | For `ITimeToIdleCache`: run the touch after a hit in the background so the read returns after a single backend read; at most one pending touch per key, failures are logged |
+| `MinTimeBetweenTouches` | `null` | For `ITimeToIdleCache`: do not touch an item that was written or touched less than this long ago; saves a write per hit on hot keys, but the item can expire up to this much earlier |
 | `MaxCount` | `null` | Maximum number of cached items for this type |
 | `MaxSize` | `null` | Maximum total size in bytes for this type |
 | `EvictionPolicy` | `FirstInFirstOut` | Strategy when `MaxCount` or `MaxSize` is exceeded |

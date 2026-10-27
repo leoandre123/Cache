@@ -27,6 +27,8 @@ builder.Services.AddCache(o =>
 });
 ```
 
+Entries are written with an expiry of their fresh span (none with stale-while-revalidate or without a fresh span). The time-to-idle touch renews it and an invalidate keeps what is left. `PeekManyAsync` reads all keys with a single `MGET` (one per hash slot on a cluster).
+
 ## MongoDB
 
 ```

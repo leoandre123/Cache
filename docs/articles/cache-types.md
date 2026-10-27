@@ -43,6 +43,20 @@ var session = await ttiCache.GetAsync<SessionData>(
     TimeSpan.FromMinutes(30));
 ```
 
+Each hit "touches" the item to reset its clock. The touch reuses the item that was just read, so a hit is one read plus one write. With the built-in Memory, MongoDB and Redis backends the touch only applies if the stored item is still the one that was read, so a value replaced or invalidated in between is never overwritten; the File backend gives that guarantee within one process. A custom `IPersist` that does not implement the item-aware `BuyMoreTime` overload touches whatever is stored. On Redis the touch also renews the key's TTL to the fresh span.
+
+To keep the write off the caller's path, opt in per type; the read then returns after a single backend read, and a failed touch is logged instead of thrown. At most one background touch per key is pending at a time, and none are started after the cache is disposed:
+
+```csharp
+o.RegisterType<SessionData, IRedis>(t => t.TouchInBackground = true);
+```
+
+For hot keys, `MinTimeBetweenTouches` skips the touch of an item that was written or touched less than that long ago. That saves a write per hit, at the cost of precision: the item can expire up to that much earlier than its idle time after the last hit.
+
+```csharp
+o.RegisterType<SessionData, IRedis>(t => t.MinTimeBetweenTouches = TimeSpan.FromSeconds(30));
+```
+
 ## IScopeCache
 
 A scoped cache instance, cleared at the end of the DI scope (for example, per HTTP request). Data never expires within the scope, which makes it a clean way to memoize a value that may be requested several times while handling a single request.

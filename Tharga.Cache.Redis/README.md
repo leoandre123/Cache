@@ -53,6 +53,13 @@ o.AddRedisDBOptions(r =>
 });
 ```
 
+## Expiry, time-to-idle and batch reads
+
+- Entries are written with a Redis expiry of their fresh span. There is no expiry for entries without a fresh span, for eternal entries, or with stale-while-revalidate, because the stale value must stay readable.
+- On an `ITimeToIdleCache` hit, the touch is one script call. It writes the entry with a new update time and renews the expiry, but only if the key still holds exactly the value that was read (the script compares a SHA1 of the stored value, so a different shape of the type in another deployment does not stop the touch). A value replaced or invalidated in between is left alone. Set `TouchInBackground` on the type to run the touch off the caller's path.
+- `InvalidateAsync` keeps the remaining expiry; it neither removes nor extends it.
+- `PeekManyAsync` reads all keys with a single `MGET`, or one per hash slot on a cluster.
+
 ## Documentation
 
 Full documentation, configuration options, and samples are available on the [GitHub project page](https://github.com/Tharga/Cache).

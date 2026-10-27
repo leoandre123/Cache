@@ -200,6 +200,23 @@ internal abstract class CacheBase : ICache
     {
         DataGetEvent?.Invoke(this, new DataGetEventArgs(key));
 
+        if (buyMoreTime && GetTypeOptions<T>().TouchInBackground)
+        {
+            _cacheMonitor.Accessed(typeof(T), key, false);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await BuyMoreTimeAsync(key, item);
+                }
+                catch (Exception ex)
+                {
+                    LogFailOpen(ex, "buy-more-time", key, typeof(T));
+                }
+            });
+            return;
+        }
+
         var moreTimeBought = false;
         if (buyMoreTime)
         {

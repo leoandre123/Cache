@@ -19,5 +19,11 @@ public record CacheTypeOptions
     public EvictionPolicy EvictionPolicy { get; set; } = EvictionPolicy.FirstInFirstOut;
     public TimeSpan? DefaultFreshSpan { get; set; }
 
+    /// <summary>
+    /// If this is set to true, the touch after an <see cref="ITimeToIdleCache"/> hit runs in the background, so the read
+    /// returns after a single backend read. A failed background touch is logged and never reaches the caller.
+    /// </summary>
+    public bool TouchInBackground { get; set; }
+
     internal Type PersistType { get; set; }
 }
